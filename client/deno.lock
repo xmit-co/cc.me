@@ -1,0 +1,39 @@
+{
+  "version": "5",
+  "specifiers": {
+    "npm:blakejs@1.2.1": "1.2.1",
+    "npm:blakejs@^1.2.1": "1.2.1",
+    "npm:ed2curve@0.3": "0.3.0",
+    "npm:ed2curve@0.3.0": "0.3.0",
+    "npm:tweetnacl@1.0.3": "1.0.3",
+    "npm:tweetnacl@^1.0.3": "1.0.3"
+  },
+  "npm": {
+    "blakejs@1.2.1": {
+      "integrity": "sha512-QXUSXI3QVc/gJME0dBpXrag1kbzOqCjCX8/b54ntNyW6sjtoqxqRk3LTmXzaJoh71zMsDCjM+47jS7XiwN/+fQ=="
+    },
+    "ed2curve@0.3.0": {
+      "integrity": "sha512-8w2fmmq3hv9rCrcI7g9hms2pMunQr1JINfcjwR9tAyZqhtyaMN991lF/ZfHfr5tzZQ8c7y7aBgZbjfbd0fjFwQ==",
+      "dependencies": [
+        "tweetnacl"
+      ]
+    },
+    "tweetnacl@1.0.3": {
+      "integrity": "sha512-6rt+RN7aOi1nGMyC4Xa5DdYiukl2UWCbcJft7YhxReBGQD7OAM8Pbxw6YMo4r2diNEA8FEmu32YOn9rhaiE5yw=="
+    }
+  },
+  "workspace": {
+    "dependencies": [
+      "npm:blakejs@1.2.1",
+      "npm:ed2curve@0.3.0",
+      "npm:tweetnacl@1.0.3"
+    ],
+    "packageJson": {
+      "dependencies": [
+        "npm:blakejs@^1.2.1",
+        "npm:ed2curve@0.3",
+        "npm:tweetnacl@^1.0.3"
+      ]
+    }
+  }
+}

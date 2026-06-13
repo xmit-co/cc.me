@@ -1,0 +1,55 @@
+version: "0.5"
+
+ordered_shutdown: true
+
+environment:
+  - PGPORT=55432
+  - PGDATABASE=cc_me
+  - PGUSER=cc_me
+  - DATABASE_URL=postgres://cc_me@127.0.0.1:55432/cc_me
+  - BIND_ADDR=127.0.0.1:3000
+
+processes:
+  postgres-init:
+    command: |
+      set -eu
+      mkdir -p .pgdata
+      if [ ! -s .pgdata/PG_VERSION ]; then
+        initdb -D .pgdata --username=cc_me --auth=trust --no-locale --encoding=UTF8 --no-sync
+      fi
+    availability:
+      restart: "no"
+
+  postgres:
+    command: |
+      set -eu
+      exec postgres -D .pgdata -p 55432 -h 127.0.0.1
+    shutdown:
+      signal: 2
+      timeout_seconds: 10
+    depends_on:
+      postgres-init:
+        condition: process_completed_successfully
+    readiness_probe:
+      exec:
+        command: pg_isready -h 127.0.0.1 -p 55432 -U cc_me
+      initial_delay_seconds: 1
+      period_seconds: 1
+
+  db:
+    command: |
+      set -eu
+      createdb -h 127.0.0.1 -p 55432 -U cc_me cc_me 2>/dev/null || true
+    depends_on:
+      postgres:
+        condition: process_healthy
+    availability:
+      restart: "no"
+
+  cc-me:
+    command: cargo run
+    depends_on:
+      db:
+        condition: process_completed_successfully
+    availability:
+      restart: "on_failure"

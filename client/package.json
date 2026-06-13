@@ -1,0 +1,25 @@
+{
+  "name": "cc-me",
+  "version": "0.7.0",
+  "description": "JS client and CLI for cc.me",
+  "bin": {
+    "cc-me": "./forward.js"
+  },
+  "type": "module",
+  "sideEffects": false,
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.js"
+    }
+  },
+  "dependencies": {
+    "blakejs": "^1.2.1",
+    "ed2curve": "^0.3.0",
+    "tweetnacl": "^1.0.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

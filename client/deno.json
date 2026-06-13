@@ -1,0 +1,8 @@
+{
+  "nodeModulesDir": "auto",
+  "imports": {
+    "blakejs": "npm:blakejs@1.2.1",
+    "ed2curve": "npm:ed2curve@0.3.0",
+    "tweetnacl": "npm:tweetnacl@1.0.3"
+  }
+}

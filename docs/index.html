@@ -1,0 +1,482 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>cc.me docs</title>
+    <meta name="color-scheme" content="light dark" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header>
+      <a class="brand" href="./">cc.me</a>
+      <nav aria-label="Sections">
+        <a href="#use-cases">Use cases</a>
+        <a href="#oauth">OAuth</a>
+        <a href="#safe-inbox">Safe inbox</a>
+        <a href="#client">JS client</a>
+      </nav>
+    </header>
+
+    <main>
+      <section class="intro">
+        <h1>OAuth callbacks. Sealed webhooks.</h1>
+        <p>
+          cc.me redirects OAuth callbacks to local targets and keeps webhook deliveries encrypted
+          until you claim and acknowledge them.
+        </p>
+      </section>
+
+      <section id="use-cases">
+        <h2>Use cases</h2>
+        <ul class="use-cases">
+          <li>
+            <strong>Local OAuth callbacks.</strong>
+            Register one HTTPS redirect URI, then trampoline OAuth responses to a local app like
+            <code>http://example.local/auth/callback</code> while preserving provider query
+            parameters.
+          </li>
+          <li>
+            <strong>Stable callback aliases.</strong>
+            Create short <code>/c/...</code> URLs for preview apps, branch environments, demos, or
+            providers that make redirect URI changes slow to review.
+          </li>
+          <li>
+            <strong>Encrypted webhook capture.</strong>
+            Point a provider at <code>/i/&lt;ed25519-public-key&gt;</code>; deliveries wait encrypted until
+            your app claims, handles, and acknowledges them.
+          </li>
+          <li>
+            <strong>Local forwarding.</strong>
+            Run the JS CLI to claim inbox deliveries and forward them to
+            <code>http://example.local:8080/webhook</code>, acknowledging only after the local
+            handler succeeds.
+          </li>
+          <li>
+            <strong>Real-time inspection.</strong>
+            Use <code>cc-me inspect</code>, <code>GET</code> cursors, or <code>peek</code> to watch
+            deliveries arrive without removing them.
+          </li>
+          <li>
+            <strong>Controlled retries.</strong>
+            Claim batches of messages, <code>ack</code> the handled IDs, and
+            <code>release</code> anything that should be retried immediately.
+          </li>
+          <li>
+            <strong>Team fanout.</strong>
+            Send one provider webhook to multiple public keys so teammates or separate services each
+            get their own encrypted copy.
+          </li>
+          <li>
+            <strong>Protocol handshakes.</strong>
+            Use adapter URLs for Webmention, WebSub, Slack Events, Pingback, Meta-style webhooks,
+            CloudEvents, and Discord Interactions when providers need endpoint-specific responses.
+          </li>
+          <li>
+            <strong>Provider verification.</strong>
+            Capture GitHub, GitLab, Stripe, and Shopify deliveries first, then verify their
+            signatures from the decrypted raw body and headers before acting on them.
+          </li>
+          <li>
+            <strong>Private test fixtures.</strong>
+            Trigger a provider in a test, claim the encrypted delivery, assert the captured request,
+            and acknowledge it when the test passes.
+          </li>
+          <li>
+            <strong>Offline handoffs.</strong>
+            Capture callbacks for a tool that is not online yet, then share only the private key
+            with the person or process allowed to read them.
+          </li>
+        </ul>
+      </section>
+
+      <section id="oauth">
+        <h2>OAuth callbacks</h2>
+        <p>
+          Use <code>/</code> with an absolute <code>at</code> target. Every callback query parameter
+          except <code>at</code> is appended to the target.
+        </p>
+        <pre><code class="language-url"><span class="tok-proto">https://</span><span class="tok-host">cc.me</span><span class="tok-path">/</span><span class="tok-query">?at=</span><span class="tok-str">http%3A%2F%2Fexample.local%2Fauth%2Fcallback</span></code></pre>
+        <h3>Short aliases</h3>
+        <p>
+          Create a path-only callback URL when a provider wants a stable redirect URI. Reusing the
+          same target returns the same alias.
+        </p>
+        <pre><code class="language-http"><span class="tok-method">POST</span> <span class="tok-path">/c</span>
+
+{
+  <span class="tok-str">"at"</span>: <span class="tok-str">"http://example.local/auth/callback"</span>
+}</code></pre>
+        <pre><code class="language-json">{
+  <span class="tok-str">"url"</span>: <span class="tok-str">"https://cc.me/c/1cuEdvnPA31f"</span>
+}</code></pre>
+      </section>
+
+      <section id="safe-inbox">
+        <h2>Safe inbox</h2>
+        <p><code>/i/&lt;base64url-ed25519-public-key&gt;</code> is a tiny encrypted inbox.</p>
+        <ul>
+          <li><code>POST</code> captures a request and stores it encrypted for that public key.</li>
+          <li>
+            <code>POST /i/&lt;key-a&gt;.&lt;key-b&gt;</code> fans out one encrypted copy to each
+            recipient.
+          </li>
+          <li>
+            The starting default keeps up to 100 hooks. When an inbox is full,
+            <code>POST</code> is rejected and existing deliveries are left alone.
+          </li>
+          <li>
+            Requests are stored only when the captured method, path, query, headers, and body fit
+            within 64 KiB; larger requests are rejected.
+          </li>
+          <li>
+            <code>GET</code> looks ahead without removing deliveries. Add optional
+            <code>?l=10</code> to set the maximum batch size and/or <code>?p</code> to wait when
+            nothing is ready. Responses include a cursor; pass it back as <code>?c=...</code> to
+            read newer visible deliveries.
+          </li>
+          <li>
+            Protocol adapters live under the same inbox:
+            <code>/webmention</code>, <code>/websub</code>, <code>/slack</code>,
+            <code>/pingback</code>, <code>/meta</code>, <code>/cloudevents</code>, and
+            <code>/discord/&lt;app-public-key&gt;</code>.
+          </li>
+        </ul>
+        <pre><code class="language-http"><span class="tok-method">POST</span> <span class="tok-path">/i/xG72MCGkluShRByISwEzZVgjIUti3_7phnEch9PxJRI</span></code></pre>
+        <p>When any recipient inbox is full, the capture is rejected.</p>
+        <pre><code class="language-http"><span class="tok-method">HTTP/1.1</span> <span class="tok-num">409</span> <span class="tok-str">Conflict</span></code></pre>
+        <pre><code class="language-json">{
+  <span class="tok-str">"error"</span>: <span class="tok-str">"inbox is full"</span>
+}</code></pre>
+        <h3>Protocol adapters</h3>
+        <p>
+          Adapters answer provider handshakes, then store the complete incoming request encrypted.
+          Most signature checks stay with the client after decrypting; Discord requests are verified
+          before capture because Discord requires that at the endpoint.
+        </p>
+        <pre><code class="language-http"><span class="tok-method">POST</span> <span class="tok-path">/i/xG72MCGkluShRByISwEzZVgjIUti3_7phnEch9PxJRI/webmention</span>
+<span class="tok-prop">content-type</span>: <span class="tok-str">application/x-www-form-urlencoded</span>
+
+<span class="tok-query">source=https%3A%2F%2Fexample.com%2Fpost&amp;target=https%3A%2F%2Fexample.net%2Fpage</span></code></pre>
+        <pre><code class="language-http"><span class="tok-method">GET</span> <span class="tok-path">/i/xG72MCGkluShRByISwEzZVgjIUti3_7phnEch9PxJRI/websub</span><span class="tok-query">?hub.mode=subscribe&amp;hub.topic=https%3A%2F%2Fexample.com%2Ffeed&amp;hub.challenge=abc</span></code></pre>
+        <pre><code class="language-http"><span class="tok-method">POST</span> <span class="tok-path">/i/xG72MCGkluShRByISwEzZVgjIUti3_7phnEch9PxJRI/slack</span>
+<span class="tok-prop">content-type</span>: <span class="tok-str">application/json</span>
+
+{
+  <span class="tok-str">"type"</span>: <span class="tok-str">"url_verification"</span>,
+  <span class="tok-str">"challenge"</span>: <span class="tok-str">"3eZbr..."</span>
+}</code></pre>
+        <pre><code class="language-http"><span class="tok-method">POST</span> <span class="tok-path">/i/xG72MCGkluShRByISwEzZVgjIUti3_7phnEch9PxJRI/pingback</span>
+<span class="tok-prop">content-type</span>: <span class="tok-str">text/xml</span>
+
+<span class="tok-str">&lt;methodCall&gt;&lt;methodName&gt;pingback.ping&lt;/methodName&gt;...&lt;/methodCall&gt;</span></code></pre>
+        <pre><code class="language-http"><span class="tok-method">GET</span> <span class="tok-path">/i/xG72MCGkluShRByISwEzZVgjIUti3_7phnEch9PxJRI/meta</span><span class="tok-query">?v=secret&amp;hub.mode=subscribe&amp;hub.verify_token=secret&amp;hub.challenge=abc</span></code></pre>
+        <pre><code class="language-http"><span class="tok-method">POST</span> <span class="tok-path">/i/xG72MCGkluShRByISwEzZVgjIUti3_7phnEch9PxJRI/cloudevents</span>
+<span class="tok-prop">ce-specversion</span>: <span class="tok-str">1.0</span>
+<span class="tok-prop">ce-id</span>: <span class="tok-str">evt_1</span>
+<span class="tok-prop">ce-source</span>: <span class="tok-str">https://example.com/source</span>
+<span class="tok-prop">ce-type</span>: <span class="tok-str">com.example.event</span>
+<span class="tok-prop">content-type</span>: <span class="tok-str">application/json</span>
+
+{ <span class="tok-str">"ok"</span>: <span class="tok-bool">true</span> }</code></pre>
+        <pre><code class="language-http"><span class="tok-method">POST</span> <span class="tok-path">/i/xG72MCGkluShRByISwEzZVgjIUti3_7phnEch9PxJRI/discord/0123456789abcdef...</span>
+<span class="tok-prop">x-signature-ed25519</span>: <span class="tok-str">...</span>
+<span class="tok-prop">x-signature-timestamp</span>: <span class="tok-num">1781337600</span>
+<span class="tok-prop">content-type</span>: <span class="tok-str">application/json</span>
+
+{ <span class="tok-str">"type"</span>: <span class="tok-num">1</span> }</code></pre>
+        <p>
+          Meta verification returns the plain <code>hub.challenge</code>. CloudEvents accepts binary
+          HTTP mode and structured JSON. Discord <code>type: 1</code> returns
+          <code>{"type":1}</code>; other valid interactions are stored and answered with
+          <code>{"type":5}</code>.
+        </p>
+        <h3>Provider recipes</h3>
+        <p>
+          GitHub, GitLab, Stripe, and Shopify can use the normal inbox URL unless you want one of
+          the adapters above. After decrypting, verify the captured raw <code>bodyBytes</code> with
+          the provider headers before acting on the payload.
+        </p>
+        <ul>
+          <li><strong>GitHub:</strong> check <code>x-hub-signature-256</code>.</li>
+          <li>
+            <strong>GitLab:</strong> prefer Standard Webhooks headers <code>webhook-id</code>,
+            <code>webhook-timestamp</code>, and <code>webhook-signature</code>; older hooks may use
+            <code>x-gitlab-token</code>.
+          </li>
+          <li><strong>Stripe:</strong> check <code>stripe-signature</code>.</li>
+          <li><strong>Shopify:</strong> check <code>x-shopify-hmac-sha256</code>.</li>
+        </ul>
+        <h3>Delivery control</h3>
+        <p>
+          Claim reserves deliveries for handling. Ack and release both take batches of IDs, but they
+          mean different things:
+        </p>
+        <ul>
+          <li>
+            <code>ack</code> means finished. The delivery is removed and will not be returned.
+          </li>
+          <li>
+            <code>release</code> means not finished. The delivery is ready for another try now.
+          </li>
+          <li>
+            If a client disappears after claiming, the service eventually makes it ready again.
+          </li>
+        </ul>
+        <h3>Owner authentication</h3>
+        <p>
+          <code>GET</code>, <code>claim</code>, <code>ack</code>, and <code>release</code> must prove
+          ownership of the inbox private key. Each request needs an
+          <code>x-cc-me-timestamp</code> header (Unix seconds) and an
+          <code>x-cc-me-signature</code> header containing a base64url Ed25519 signature of:
+        </p>
+        <pre><code class="language-text">cc-me-v1
+{METHOD}
+{PATH}
+{TIMESTAMP}
+{SHA256(BODY) base64url}</code></pre>
+        <p>The JS client adds these headers automatically.</p>
+        <h3>GET responses</h3>
+        <p>
+          <code>GET</code> looks ahead without removing deliveries. GET and claim responses include
+          only as many items as fit within 1 MiB.
+        </p>
+        <pre><code class="language-http"><span class="tok-method">GET</span> <span class="tok-path">/i/xG72MCGkluShRByISwEzZVgjIUti3_7phnEch9PxJRI</span><span class="tok-query">?l=10&amp;p</span>
+<span class="tok-prop">x-cc-me-timestamp</span>: <span class="tok-num">1781337600</span>
+<span class="tok-prop">x-cc-me-signature</span>: <span class="tok-str">base64url-ed25519-signature</span></code></pre>
+        <pre><code class="language-json">{
+  <span class="tok-str">"count"</span>: <span class="tok-num">1</span>,
+  <span class="tok-str">"items"</span>: [
+    {
+      <span class="tok-str">"id"</span>: <span class="tok-str">"m_01k8v7xq7gx1a8p0g7nq0f"</span>,
+      <span class="tok-str">"sealed"</span>: <span class="tok-str">"base64url-encrypted-delivery"</span>
+    }
+  ],
+  <span class="tok-str">"cursor"</span>: <span class="tok-str">"opaque-cursor"</span>
+}</code></pre>
+        <h3>Claim</h3>
+        <p>Claim reserves ready deliveries until you ack or release them.</p>
+        <pre><code class="language-http"><span class="tok-method">POST</span> <span class="tok-path">/i/xG72MCGkluShRByISwEzZVgjIUti3_7phnEch9PxJRI/claim</span>
+<span class="tok-prop">x-cc-me-timestamp</span>: <span class="tok-num">1781337600</span>
+<span class="tok-prop">x-cc-me-signature</span>: <span class="tok-str">base64url-ed25519-signature</span>
+
+{
+  <span class="tok-str">"limit"</span>: <span class="tok-num">10</span>,
+  <span class="tok-str">"poll"</span>: <span class="tok-bool">true</span>
+}</code></pre>
+        <pre><code class="language-json">{
+  <span class="tok-str">"count"</span>: <span class="tok-num">1</span>,
+  <span class="tok-str">"items"</span>: [
+    {
+      <span class="tok-str">"id"</span>: <span class="tok-str">"m_01k8v7xq7gx1a8p0g7nq0f"</span>,
+      <span class="tok-str">"sealed"</span>: <span class="tok-str">"base64url-encrypted-delivery"</span>
+    }
+  ]
+}</code></pre>
+        <h3>Ack</h3>
+        <p>Ack removes handled deliveries. Unknown or already-gone IDs are returned as missing.</p>
+        <pre><code class="language-http"><span class="tok-method">POST</span> <span class="tok-path">/i/xG72MCGkluShRByISwEzZVgjIUti3_7phnEch9PxJRI/ack</span>
+<span class="tok-prop">x-cc-me-timestamp</span>: <span class="tok-num">1781337600</span>
+<span class="tok-prop">x-cc-me-signature</span>: <span class="tok-str">base64url-ed25519-signature</span>
+
+{
+  <span class="tok-str">"ids"</span>: [<span class="tok-str">"m_01k8v7xq7gx1a8p0g7nq0f"</span>]
+}</code></pre>
+        <pre><code class="language-json">{
+  <span class="tok-str">"acked"</span>: <span class="tok-num">1</span>,
+  <span class="tok-str">"missing"</span>: []
+}</code></pre>
+        <h3>Release</h3>
+        <p>Release makes claimed deliveries ready again without deleting them.</p>
+        <pre><code class="language-http"><span class="tok-method">POST</span> <span class="tok-path">/i/xG72MCGkluShRByISwEzZVgjIUti3_7phnEch9PxJRI/release</span>
+<span class="tok-prop">x-cc-me-timestamp</span>: <span class="tok-num">1781337600</span>
+<span class="tok-prop">x-cc-me-signature</span>: <span class="tok-str">base64url-ed25519-signature</span>
+
+{
+  <span class="tok-str">"ids"</span>: [<span class="tok-str">"m_01k8v7xq7gx1a8p0g7nq0f"</span>]
+}</code></pre>
+        <pre><code class="language-json">{
+  <span class="tok-str">"released"</span>: <span class="tok-num">1</span>,
+  <span class="tok-str">"missing"</span>: []
+}</code></pre>
+        <p>After decrypting an item with your private key, the payload has this shape.</p>
+        <pre><code class="language-json">{
+  <span class="tok-str">"id"</span>: <span class="tok-str">"m_01k8v7xq7gx1a8p0g7nq0f"</span>,
+  <span class="tok-str">"received_at_unix_ms"</span>: <span class="tok-num">1781337600000</span>,
+  <span class="tok-str">"method"</span>: <span class="tok-str">"POST"</span>,
+  <span class="tok-str">"path"</span>: <span class="tok-str">"/i/..."</span>,
+  <span class="tok-str">"query"</span>: <span class="tok-str">"source=github&amp;delivery=42"</span>,
+  <span class="tok-str">"headers"</span>: [
+    {
+      <span class="tok-str">"name"</span>: <span class="tok-str">"content-type"</span>,
+      <span class="tok-str">"value_b64u"</span>: <span class="tok-str">"YXBwbGljYXRpb24vanNvbg"</span>
+    }
+  ],
+  <span class="tok-str">"body_b64u"</span>: <span class="tok-str">"e30"</span>
+}</code></pre>
+      </section>
+
+      <section id="client">
+        <h2>JS client</h2>
+        <p>
+          Forward a Safe inbox to a local endpoint with the
+          <a href="https://www.npmjs.com/package/cc-me"><code>cc-me</code></a>
+          command:
+        </p>
+        <pre><code class="language-sh"><span class="tok-call">npx</span> <span class="tok-str">cc-me</span> <span class="tok-str">http://example.local:8080/webhook</span>
+<span class="tok-call">pnpx</span> <span class="tok-str">cc-me</span> <span class="tok-str">http://example.local:8080/webhook</span>
+<span class="tok-call">bunx</span> <span class="tok-str">cc-me</span> <span class="tok-str">http://example.local:8080/webhook</span>
+<span class="tok-call">deno</span> <span class="tok-id">run</span> <span class="tok-str">-A</span> <span class="tok-str">npm:cc-me</span> <span class="tok-str">http://example.local:8080/webhook</span></code></pre>
+        <p>Or inspect a Safe inbox locally before acknowledging deliveries:</p>
+        <pre><code class="language-sh"><span class="tok-call">npx</span> <span class="tok-str">cc-me</span> <span class="tok-id">inspect</span>
+<span class="tok-call">pnpx</span> <span class="tok-str">cc-me</span> <span class="tok-id">inspect</span>
+<span class="tok-call">bunx</span> <span class="tok-str">cc-me</span> <span class="tok-id">inspect</span>
+<span class="tok-call">deno</span> <span class="tok-id">run</span> <span class="tok-str">-A</span> <span class="tok-str">npm:cc-me</span> <span class="tok-id">inspect</span></code></pre>
+        <p>
+          The forwarder persists and reuses <code>~/.cc-me.key</code> by default. Use
+          <code>--key</code> to choose a different key file:
+        </p>
+        <pre><code class="language-sh"><span class="tok-call">npx</span> <span class="tok-str">cc-me</span> <span class="tok-str">--key</span> <span class="tok-str">~/hooks.key</span> <span class="tok-str">http://example.local:8080/webhook</span></code></pre>
+        <p>
+          The package works as ESM in browsers, Node.js, Bun, and Deno. In browsers,
+          <code>privateKey()</code> creates an in-memory key, or you can pass a stored key string to
+          <code>new CcMeClient({ privateKey })</code>. In Node.js, Bun, and Deno,
+          <code>privateKey(path)</code> creates a key file private to the user if it does not exist
+          yet, then reuses it on later runs.
+        </p>
+        <pre><code class="language-js"><span class="tok-kw">import</span> { <span class="tok-id">homedir</span> } <span class="tok-kw">from</span> <span class="tok-str">"node:os"</span>;
+<span class="tok-kw">import</span> { <span class="tok-id">CcMeClient</span>, <span class="tok-id">createAlias</span>, <span class="tok-id">privateKey</span> } <span class="tok-kw">from</span> <span class="tok-str">"cc-me"</span>;
+
+<span class="tok-kw">const</span> <span class="tok-id">alias</span> = <span class="tok-kw">await</span> <span class="tok-call">createAlias</span>(<span class="tok-str">"http://example.local/auth/callback"</span>);
+<span class="tok-id">console</span>.<span class="tok-call">log</span>(<span class="tok-id">alias</span>.<span class="tok-prop">url</span>);
+
+<span class="tok-kw">const</span> <span class="tok-id">key</span> = <span class="tok-kw">await</span> <span class="tok-call">privateKey</span>(<span class="tok-str">`${homedir()}/.cc-me.key`</span>);
+<span class="tok-kw">const</span> <span class="tok-id">cc</span> = <span class="tok-kw">new</span> <span class="tok-call">CcMeClient</span>({ <span class="tok-prop">privateKey</span>: <span class="tok-id">key</span> });
+
+<span class="tok-id">console</span>.<span class="tok-call">log</span>(<span class="tok-kw">await</span> <span class="tok-id">cc</span>.<span class="tok-call">inboxUrl</span>());
+
+<span class="tok-kw">const</span> { <span class="tok-id">requests</span> } = <span class="tok-kw">await</span> <span class="tok-id">cc</span>.<span class="tok-call">claim</span>({
+  <span class="tok-prop">limit</span>: <span class="tok-num">10</span>,
+  <span class="tok-prop">poll</span>: <span class="tok-bool">true</span>,
+});
+
+<span class="tok-kw">const</span> <span class="tok-id">handled</span> = [];
+<span class="tok-kw">for</span> (<span class="tok-kw">const</span> <span class="tok-id">request</span> <span class="tok-kw">of</span> <span class="tok-id">requests</span>) {
+  <span class="tok-id">console</span>.<span class="tok-call">log</span>(<span class="tok-id">request</span>.<span class="tok-prop">method</span>, <span class="tok-id">request</span>.<span class="tok-prop">path</span>, <span class="tok-id">request</span>.<span class="tok-call">text</span>());
+  <span class="tok-id">handled</span>.<span class="tok-call">push</span>(<span class="tok-id">request</span>.<span class="tok-prop">id</span>);
+}
+
+<span class="tok-kw">await</span> <span class="tok-id">cc</span>.<span class="tok-call">ack</span>(<span class="tok-id">handled</span>);</code></pre>
+      </section>
+
+      <section id="stats" class="stats">
+        <h2>Stats</h2>
+        <div class="charts">
+          <article>
+            <h3>Redirects, 48h</h3>
+            <canvas id="h-redirects"></canvas>
+          </article>
+          <article>
+            <h3>Inboxes, 48h</h3>
+            <canvas id="h-inboxes"></canvas>
+          </article>
+          <article>
+            <h3>Inboxed, 48h</h3>
+            <canvas id="h-inboxed_messages"></canvas>
+          </article>
+          <article>
+            <h3>Redirects, 30d</h3>
+            <canvas id="d-redirects"></canvas>
+          </article>
+          <article>
+            <h3>Inboxes, 30d</h3>
+            <canvas id="d-inboxes"></canvas>
+          </article>
+          <article>
+            <h3>Inboxed, 30d</h3>
+            <canvas id="d-inboxed_messages"></canvas>
+          </article>
+        </div>
+      </section>
+
+      <footer>
+        By <a href="https://xmit.dev/">xmit dev team</a>. We respect privacy: deliveries are
+        encrypted for your key, no logs are collected, and public stats are aggregate.
+      </footer>
+    </main>
+    <script>
+      const nf = new Intl.NumberFormat();
+      const css = getComputedStyle(document.documentElement);
+      const color = css.getPropertyValue("--a").trim();
+      const muted = css.getPropertyValue("--m").trim();
+      function context(canvas) {
+        const ratio = devicePixelRatio || 1;
+        const box = canvas.getBoundingClientRect();
+        canvas.width = box.width * ratio;
+        canvas.height = box.height * ratio;
+        const ctx = canvas.getContext("2d");
+        ctx.scale(ratio, ratio);
+        return [ctx, box.width, box.height];
+      }
+      function drawSparkline(id, values, total) {
+        const canvas = document.getElementById(id);
+        let points = [];
+        function paint(mark) {
+          const [ctx, width, height] = context(canvas);
+          const max = Math.max(...values, 1);
+          const pad = height / 12;
+          points = values.map((value, i) => ({
+            value,
+            x: pad + (i * (width - 2 * pad)) / Math.max(1, values.length - 1),
+            y: height - pad - ((height - 2 * pad) * value) / max,
+          }));
+          ctx.clearRect(0, 0, width, height);
+          ctx.strokeStyle = color;
+          ctx.lineWidth = height / 28;
+          ctx.beginPath();
+          points.forEach((point, i) => ctx[i ? "lineTo" : "moveTo"](point.x, point.y));
+          ctx.stroke();
+          ctx.fillStyle = muted;
+          ctx.font = "1em ui-monospace, monospace";
+          ctx.textAlign = "right";
+          ctx.fillText(nf.format(mark ? mark.value : total), width - pad, height - pad);
+          if (mark) {
+            ctx.beginPath();
+            ctx.arc(mark.x, mark.y, height / 16, 0, Math.PI * 2);
+            ctx.fillStyle = color;
+            ctx.fill();
+          }
+        }
+        paint();
+        canvas.addEventListener("mousemove", (event) => {
+          const box = canvas.getBoundingClientRect();
+          const x = event.clientX - box.left;
+          paint(
+            points.reduce((best, point) =>
+              Math.abs(point.x - x) < Math.abs(best.x - x) ? point : best,
+            ),
+          );
+        });
+        canvas.addEventListener("mouseleave", () => paint());
+      }
+      const draw = (prefix, data, totals) => {
+        for (const key of ["redirects", "inboxes", "inboxed_messages"]) {
+          drawSparkline(
+            `${prefix}-${key}`,
+            data.map((bucket) => bucket[key]),
+            totals[key],
+          );
+        }
+      };
+      fetch(location.hostname === "www.cc.me" ? "https://cc.me/stats" : "/stats")
+        .then((r) => r.json())
+        .then((s) => {
+          draw("h", s.hourly, s.last_48_hours);
+          draw("d", s.daily, s.last_30_days);
+        })
+        .catch(() => {
+          document.querySelector(".charts").textContent = "Stats unavailable";
+        });
+    </script>
+  </body>
+</html>
