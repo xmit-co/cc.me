@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cc-me"
+version = "0.1.0"
+description = "cc.me trampoline and encrypted webhook queue client + CLI"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = ["pynacl>=1.5"]
+
+[project.scripts]
+cc-me = "cc_me.forward:main"
+
+[tool.setuptools]
+packages = ["cc_me"]

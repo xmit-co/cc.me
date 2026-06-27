@@ -52,7 +52,11 @@ nix run github:xmit-co/cc.me
 | `INBOX_MAX_GET_LIMIT`     |                               `1000` | Cap for requested batch sizes                           |
 | `INBOX_LONG_POLL_SECONDS` |                                 `25` | Long-poll wait used by `?p` and `claim({ poll: true })` |
 
-Static docs live in `docs/`. The JS client package lives in `client/`.
+Static docs live in `docs/`. The Go client is the module at the repository root
+(`go install cc.me@latest` for the CLI, `import "cc.me/ccme"` for the library;
+the server answers the `go-import` handshake on `?go-get=1`). The other clients
+live under `client/`: the JavaScript package in `client/js/`, plus ports in
+`client/python/`, `client/rust/`, and `client/ruby/`.
 
 The client CLI can forward or inspect inbox deliveries:
 

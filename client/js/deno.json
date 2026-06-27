@@ -1,5 +1,8 @@
 {
   "nodeModulesDir": "auto",
+  "tasks": {
+    "test": "deno test -A"
+  },
   "imports": {
     "blakejs": "npm:blakejs@1.2.1",
     "ed2curve": "npm:ed2curve@0.3.0",

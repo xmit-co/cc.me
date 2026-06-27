@@ -170,7 +170,7 @@ dependencies = [
 
 [[package]]
 name = "cc-me"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "base64",
@@ -178,11 +178,13 @@ dependencies = [
  "crypto_box",
  "curve25519-dalek 4.1.3",
  "ed25519-dalek",
+ "http-body-util",
  "serde",
  "serde_json",
  "sha2",
  "sqlx",
  "tokio",
+ "tower",
  "tower-http",
  "tracing",
  "tracing-subscriber",

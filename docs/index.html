@@ -5,6 +5,11 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>cc.me docs</title>
     <meta name="color-scheme" content="light dark" />
+    <meta name="go-import" content="cc.me git https://github.com/xmit-co/cc.me" />
+    <meta
+      name="go-source"
+      content="cc.me https://github.com/xmit-co/cc.me https://github.com/xmit-co/cc.me/tree/main{/dir} https://github.com/xmit-co/cc.me/blob/main{/dir}/{file}#L{line}"
+    />
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
@@ -13,8 +18,8 @@
       <nav aria-label="Sections">
         <a href="#use-cases">Use cases</a>
         <a href="#oauth">OAuth</a>
-        <a href="#safe-inbox">Safe inbox</a>
-        <a href="#client">JS client</a>
+        <a href="#inbox">Inbox</a>
+        <a href="#clients">Clients</a>
       </nav>
     </header>
 
@@ -72,8 +77,8 @@
 }</code></pre>
       </section>
 
-      <section id="safe-inbox">
-        <h2>Safe inbox</h2>
+      <section id="inbox">
+        <h2>Inbox</h2>
         <p>
           <code>/i/&lt;base64url-ed25519-public-key&gt;</code> is a tiny encrypted inbox.
           <code>POST</code> stores a request encrypted for that key;
@@ -202,10 +207,20 @@
 }</code></pre>
       </section>
 
-      <section id="client">
-        <h2>JS client</h2>
+      <section id="clients">
+        <h2>Clients</h2>
         <p>
-          Forward a Safe inbox to a local endpoint with the
+          Client libraries build trampoline URLs and read inbox deliveries. The JavaScript,
+          Python, Go, Rust, and Ruby ports share one
+          <a href="https://github.com/xmit-co/cc.me/blob/main/client/PROTOCOL.md">wire protocol</a>,
+          and each ships a <code>cc-me</code> forwarder that claims deliveries and replays them to a
+          local endpoint. Keys are stored at <code>~/.cc-me.key</code> by default
+          (<code>--key</code> or <code>CC_ME_KEY</code> to override).
+        </p>
+
+        <h3>JavaScript</h3>
+        <p>
+          Forward an inbox to a local endpoint with the
           <a href="https://www.npmjs.com/package/cc-me"><code>cc-me</code></a>
           command:
         </p>
@@ -213,7 +228,7 @@
 <span class="tok-call">pnpx</span> <span class="tok-str">cc-me</span> <span class="tok-str">http://example.local:8080/webhook</span>
 <span class="tok-call">bunx</span> <span class="tok-str">cc-me</span> <span class="tok-str">http://example.local:8080/webhook</span>
 <span class="tok-call">deno</span> <span class="tok-id">run</span> <span class="tok-str">-A</span> <span class="tok-str">npm:cc-me</span> <span class="tok-str">http://example.local:8080/webhook</span></code></pre>
-        <p>Or inspect a Safe inbox locally before acknowledging deliveries:</p>
+        <p>Or inspect an inbox locally before acknowledging deliveries:</p>
         <pre><code class="language-sh"><span class="tok-call">npx</span> <span class="tok-str">cc-me</span> <span class="tok-id">inspect</span>
 <span class="tok-call">pnpx</span> <span class="tok-str">cc-me</span> <span class="tok-id">inspect</span>
 <span class="tok-call">bunx</span> <span class="tok-str">cc-me</span> <span class="tok-id">inspect</span>
@@ -252,6 +267,92 @@
 }
 
 <span class="tok-kw">await</span> <span class="tok-id">cc</span>.<span class="tok-call">ack</span>(<span class="tok-id">handled</span>);</code></pre>
+        <p>The <code>inspect</code> subcommand is JavaScript-only.</p>
+
+        <h3>Python</h3>
+        <p>Install from PyPI (Python 3.10+, PyNaCl), then forward:</p>
+        <pre><code class="language-sh"><span class="tok-call">pip</span> <span class="tok-id">install</span> <span class="tok-str">cc-me</span>
+<span class="tok-call">cc-me</span> <span class="tok-str">http://example.local:8080/webhook</span></code></pre>
+        <pre><code class="language-py"><span class="tok-kw">from</span> <span class="tok-id">pathlib</span> <span class="tok-kw">import</span> <span class="tok-id">Path</span>
+<span class="tok-kw">from</span> <span class="tok-id">cc_me</span> <span class="tok-kw">import</span> <span class="tok-id">CcMeClient</span>, <span class="tok-id">create_alias</span>, <span class="tok-id">private_key</span>
+
+<span class="tok-id">alias</span> = <span class="tok-call">create_alias</span>(<span class="tok-str">"http://example.local/auth/callback"</span>)
+<span class="tok-call">print</span>(<span class="tok-id">alias</span>.<span class="tok-prop">url</span>)
+
+<span class="tok-id">cc</span> = <span class="tok-call">CcMeClient</span>(<span class="tok-prop">private_key</span>=<span class="tok-call">private_key</span>(<span class="tok-id">Path</span>.<span class="tok-call">home</span>() / <span class="tok-str">".cc-me.key"</span>))
+<span class="tok-id">handled</span> = []
+<span class="tok-kw">for</span> <span class="tok-id">request</span> <span class="tok-kw">in</span> <span class="tok-id">cc</span>.<span class="tok-call">claim</span>(<span class="tok-prop">limit</span>=<span class="tok-num">10</span>, <span class="tok-prop">poll</span>=<span class="tok-bool">True</span>).<span class="tok-prop">requests</span>:
+    <span class="tok-call">print</span>(<span class="tok-id">request</span>.<span class="tok-prop">method</span>, <span class="tok-id">request</span>.<span class="tok-prop">path</span>, <span class="tok-id">request</span>.<span class="tok-call">text</span>())
+    <span class="tok-id">handled</span>.<span class="tok-call">append</span>(<span class="tok-id">request</span>.<span class="tok-prop">id</span>)
+<span class="tok-id">cc</span>.<span class="tok-call">ack</span>(<span class="tok-id">handled</span>)</code></pre>
+
+        <h3>Go</h3>
+        <p>
+          Install the forwarder from the <code>cc.me</code> vanity path; the server answers the
+          <code>go-import</code> handshake, so the installed binary is named <code>cc.me</code>:
+        </p>
+        <pre><code class="language-sh"><span class="tok-call">go</span> <span class="tok-id">install</span> <span class="tok-str">cc.me@latest</span>
+<span class="tok-call">cc.me</span> <span class="tok-str">http://example.local:8080/webhook</span></code></pre>
+        <p>The library lives at <code>cc.me/ccme</code>:</p>
+        <pre><code class="language-go"><span class="tok-kw">import</span> (
+    <span class="tok-str">"fmt"</span>
+
+    <span class="tok-id">ccme</span> <span class="tok-str">"cc.me/ccme"</span>
+)
+
+<span class="tok-id">key</span>, <span class="tok-id">_</span> := <span class="tok-id">ccme</span>.<span class="tok-call">PrivateKey</span>(<span class="tok-str">"/path/to/.cc-me.key"</span>)
+<span class="tok-id">cc</span>, <span class="tok-id">_</span> := <span class="tok-id">ccme</span>.<span class="tok-call">NewClient</span>(<span class="tok-str">""</span>, <span class="tok-id">key</span>)
+
+<span class="tok-id">batch</span>, <span class="tok-id">_</span> := <span class="tok-id">cc</span>.<span class="tok-call">Claim</span>(<span class="tok-id">ccme</span>.<span class="tok-call">ClaimOptions</span>{<span class="tok-prop">Limit</span>: <span class="tok-num">10</span>, <span class="tok-prop">Poll</span>: <span class="tok-bool">true</span>})
+<span class="tok-kw">var</span> <span class="tok-id">handled</span> []<span class="tok-kw">string</span>
+<span class="tok-kw">for</span> <span class="tok-id">_</span>, <span class="tok-id">d</span> := <span class="tok-kw">range</span> <span class="tok-id">batch</span>.<span class="tok-prop">Requests</span> {
+    <span class="tok-id">fmt</span>.<span class="tok-call">Println</span>(<span class="tok-id">d</span>.<span class="tok-prop">Method</span>, <span class="tok-id">d</span>.<span class="tok-prop">Path</span>, <span class="tok-id">d</span>.<span class="tok-call">Text</span>())
+    <span class="tok-id">handled</span> = <span class="tok-call">append</span>(<span class="tok-id">handled</span>, <span class="tok-id">d</span>.<span class="tok-prop">ID</span>)
+}
+<span class="tok-id">cc</span>.<span class="tok-call">Ack</span>(<span class="tok-id">handled</span>)</code></pre>
+
+        <h3>Rust</h3>
+        <p>
+          Install the <code>cc-me</code> binary, or add the
+          <a href="https://crates.io/crates/cc-me"><code>cc-me</code></a> crate with
+          <code>cargo add cc-me</code>:
+        </p>
+        <pre><code class="language-sh"><span class="tok-call">cargo</span> <span class="tok-id">install</span> <span class="tok-str">cc-me</span>
+<span class="tok-call">cc-me</span> <span class="tok-str">http://example.local:8080/webhook</span></code></pre>
+        <pre><code class="language-rs"><span class="tok-kw">use</span> <span class="tok-id">cc_me</span>::{<span class="tok-id">CcMeClient</span>, <span class="tok-id">ListOptions</span>, <span class="tok-id">private_key</span>};
+<span class="tok-kw">use</span> <span class="tok-id">std</span>::<span class="tok-id">path</span>::<span class="tok-id">Path</span>;
+
+<span class="tok-kw">let</span> <span class="tok-id">key</span> = <span class="tok-call">private_key</span>(<span class="tok-id">Some</span>(<span class="tok-id">Path</span>::<span class="tok-call">new</span>(<span class="tok-str">"/path/to/.cc-me.key"</span>)))?;
+<span class="tok-kw">let</span> <span class="tok-id">cc</span> = <span class="tok-id">CcMeClient</span>::<span class="tok-call">new</span>(<span class="tok-id">key</span>, <span class="tok-id">None</span>)?;
+
+<span class="tok-kw">let</span> <span class="tok-id">batch</span> = <span class="tok-id">cc</span>.<span class="tok-call">claim</span>(&<span class="tok-id">ListOptions</span> { <span class="tok-prop">limit</span>: <span class="tok-id">Some</span>(<span class="tok-num">10</span>), <span class="tok-prop">poll</span>: <span class="tok-bool">true</span>, ..<span class="tok-id">Default</span>::<span class="tok-call">default</span>() })?;
+<span class="tok-kw">let</span> <span class="tok-kw">mut</span> <span class="tok-id">handled</span> = <span class="tok-id">Vec</span>::<span class="tok-call">new</span>();
+<span class="tok-kw">for</span> <span class="tok-id">d</span> <span class="tok-kw">in</span> &<span class="tok-id">batch</span>.<span class="tok-prop">requests</span> {
+    <span class="tok-call">println!</span>(<span class="tok-str">"{} {} {}"</span>, <span class="tok-id">d</span>.<span class="tok-prop">method</span>, <span class="tok-id">d</span>.<span class="tok-prop">path</span>, <span class="tok-id">d</span>.<span class="tok-call">text</span>());
+    <span class="tok-id">handled</span>.<span class="tok-call">push</span>(<span class="tok-id">d</span>.<span class="tok-prop">id</span>.<span class="tok-call">clone</span>());
+}
+<span class="tok-id">cc</span>.<span class="tok-call">ack</span>(&<span class="tok-id">handled</span>)?;</code></pre>
+
+        <h3>Ruby</h3>
+        <p>Install the gem (Ruby 3.0+, RbNaCl with libsodium), then forward:</p>
+        <pre><code class="language-sh"><span class="tok-call">gem</span> <span class="tok-id">install</span> <span class="tok-str">cc-me</span>
+<span class="tok-call">cc-me</span> <span class="tok-str">http://example.local:8080/webhook</span></code></pre>
+        <pre><code class="language-rb"><span class="tok-call">require</span> <span class="tok-str">"cc_me"</span>
+
+<span class="tok-id">alias_url</span> = <span class="tok-id">CcMe</span>.<span class="tok-call">create_alias</span>(<span class="tok-str">"http://example.local/auth/callback"</span>)
+<span class="tok-call">puts</span> <span class="tok-id">alias_url</span>.<span class="tok-prop">url</span>
+
+<span class="tok-id">key</span> = <span class="tok-id">CcMe</span>.<span class="tok-call">private_key</span>(<span class="tok-id">File</span>.<span class="tok-call">join</span>(<span class="tok-id">Dir</span>.<span class="tok-call">home</span>, <span class="tok-str">".cc-me.key"</span>))
+<span class="tok-id">cc</span> = <span class="tok-id">CcMe</span>::<span class="tok-id">Client</span>.<span class="tok-call">new</span>(<span class="tok-prop">private_key:</span> <span class="tok-id">key</span>)
+
+<span class="tok-call">puts</span> <span class="tok-id">cc</span>.<span class="tok-call">inbox_url</span>
+
+<span class="tok-id">handled</span> = []
+<span class="tok-id">cc</span>.<span class="tok-call">claim</span>(<span class="tok-prop">limit:</span> <span class="tok-num">10</span>, <span class="tok-prop">poll:</span> <span class="tok-bool">true</span>).<span class="tok-prop">requests</span>.<span class="tok-call">each</span> <span class="tok-kw">do</span> |<span class="tok-id">request</span>|
+  <span class="tok-call">puts</span> [<span class="tok-id">request</span>.<span class="tok-prop">method</span>, <span class="tok-id">request</span>.<span class="tok-prop">path</span>, <span class="tok-id">request</span>.<span class="tok-call">text</span>].<span class="tok-call">join</span>(<span class="tok-str">" "</span>)
+  <span class="tok-id">handled</span> &lt;&lt; <span class="tok-id">request</span>.<span class="tok-prop">id</span>
+<span class="tok-kw">end</span>
+<span class="tok-id">cc</span>.<span class="tok-call">ack</span>(<span class="tok-id">handled</span>)</code></pre>
       </section>
 
       <section id="stats" class="stats">

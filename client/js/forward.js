@@ -82,7 +82,7 @@ function setOption(options, name, value) {
   }
 }
 
-function headerList(headers) {
+export function headerList(headers) {
   const out = [];
   for (const header of headers) {
     if (!hopByHopHeader(header.name)) {
@@ -92,7 +92,7 @@ function headerList(headers) {
   return out;
 }
 
-function hopByHopHeader(name) {
+export function hopByHopHeader(name) {
   switch (name.toLowerCase()) {
     case "connection":
     case "content-length":
@@ -110,7 +110,7 @@ function hopByHopHeader(name) {
   }
 }
 
-function forwardUrl(base, request) {
+export function forwardUrl(base, request) {
   const url = new URL(base);
   if (request.query) {
     url.search = url.search ? `${url.search.slice(1)}&${request.query}` : request.query;
@@ -118,7 +118,7 @@ function forwardUrl(base, request) {
   return url;
 }
 
-async function forwardRequest(target, request) {
+export async function forwardRequest(target, request) {
   const hasBody =
     request.method !== "GET" && request.method !== "HEAD" && request.bodyBytes.length > 0;
   const response = await fetch(forwardUrl(target, request), {
@@ -131,7 +131,7 @@ async function forwardRequest(target, request) {
   }
 }
 
-async function newClient(keyFile) {
+export async function newClient(keyFile) {
   const key = await privateKey(keyFile);
   return new CcMeClient({
     baseUrl: process.env.CC_ME_URL,
@@ -139,7 +139,7 @@ async function newClient(keyFile) {
   });
 }
 
-async function forwardLoop({ keyFile, target }) {
+export async function forwardLoop({ keyFile, target }) {
   if (!target) {
     usage();
     process.exit(64);
@@ -532,7 +532,14 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  console.error(error.message);
-  process.exit(1);
-});
+const isMain =
+  typeof process !== "undefined" &&
+  Array.isArray(process.argv) &&
+  import.meta.url === `file://${process.argv[1]}`;
+
+if (isMain) {
+  main().catch((error) => {
+    console.error(error.message);
+    process.exit(1);
+  });
+}

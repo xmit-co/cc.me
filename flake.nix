@@ -63,6 +63,11 @@
             pkgs.nodejs
             pkgs.bun
             pkgs.deno
+            pkgs.go
+            pkgs.uv
+            (pkgs.python3.withPackages (ps: [ ps.pynacl ]))
+            pkgs.ruby
+            pkgs.libsodium
             xmit.packages.${system}.default
           ];
         };

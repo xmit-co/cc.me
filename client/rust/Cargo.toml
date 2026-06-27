@@ -1,0 +1,38 @@
+# Standalone crate: an empty [workspace] table stops cargo from trying to
+# fold this into the parent server package's (non-existent) workspace.
+[workspace]
+
+[package]
+name = "cc-me"
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+description = "Client library and forward CLI for cc.me"
+
+[lib]
+name = "cc_me"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cc-me"
+path = "src/main.rs"
+
+[dependencies]
+# Crypto crates pinned to the exact versions the server locks, so the sealed-box
+# decrypt path interoperates with the server's `PublicKey::seal`.
+base64 = "0.22.1"
+crypto_box = { version = "0.10.0-pre.0", features = ["seal", "std"] }
+ed25519-dalek = "2.2.0"
+sha2 = "0.10"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.149"
+# Blocking HTTP client. Not in the server's Cargo.lock, so this needs a network
+# fetch on first build.
+ureq = { version = "2", features = ["json"] }
+# OS randomness for generating new key seeds (already a transitive dep).
+getrandom = "0.3"
+
+[dev-dependencies]
+# Used only by the interop test to replicate the server's Ed25519 -> X25519
+# public-key derivation (the `derive_x25519_public_key` path) when sealing.
+curve25519-dalek = "4"

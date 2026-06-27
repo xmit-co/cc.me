@@ -12,8 +12,9 @@ use std::{
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{DefaultBodyLimit, Path, RawQuery, State},
+    extract::{DefaultBodyLimit, Path, RawQuery, Request, State},
     http::{HeaderMap, Method, StatusCode, Uri, header},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -47,6 +48,13 @@ const AUTH_TIMESTAMP_HEADER: &str = "x-cc-me-timestamp";
 const AUTH_VERSION: &str = "cc-me-v1";
 const AUTH_WINDOW_SECONDS: u64 = 5 * 60;
 const DOCS_REDIRECT: &str = "https://www.cc.me/";
+const GO_IMPORT_HTML: &str = concat!(
+    "<!doctype html>\n",
+    "<meta name=\"go-import\" content=\"cc.me git https://github.com/xmit-co/cc.me\">\n",
+    "<meta name=\"go-source\" content=\"cc.me https://github.com/xmit-co/cc.me ",
+    "https://github.com/xmit-co/cc.me/tree/main{/dir} ",
+    "https://github.com/xmit-co/cc.me/blob/main{/dir}/{file}#L{line}\">\n",
+);
 const CLAIM_RECOVERY_SECONDS: u64 = 10 * 60;
 const INBOX_NOTIFY_CHANNEL: &str = "cc_i";
 const INBOX_NOTIFY_CAPACITY: usize = 4096;
@@ -285,6 +293,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .allow_headers(Any),
         )
         .layer(DefaultBodyLimit::max(MAX_CAPTURE_BYTES))
+        .layer(middleware::from_fn(serve_go_import))
         .with_state(AppState {
             db,
             inbox_tx,
@@ -2347,6 +2356,24 @@ fn validate_cursor(cursor: &Cursor) -> AppResult<()> {
     Ok(())
 }
 
+// `go get`/`go install` fetch `https://cc.me/<path>?go-get=1` and look for a
+// go-import meta tag. The Go tool hits this server (cc.me), not the static docs
+// at www.cc.me, so we answer the handshake here for every path.
+async fn serve_go_import(request: Request, next: Next) -> Response {
+    if request.uri().query().is_some_and(query_wants_go_import) {
+        return (
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            GO_IMPORT_HTML,
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
+fn query_wants_go_import(query: &str) -> bool {
+    form_urlencoded::parse(query.as_bytes()).any(|(key, value)| key == "go-get" && value == "1")
+}
+
 fn redirect(location: &str) -> AppResult<Response> {
     let location = header::HeaderValue::from_str(location)
         .map_err(|_| AppError::new(StatusCode::BAD_REQUEST, "invalid redirect target"))?;
@@ -2426,8 +2453,77 @@ fn env_f64(name: &str, default: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
     use ed25519_dalek::Signer;
+    use http_body_util::BodyExt;
     use sha2::Sha512;
+    use tower::ServiceExt;
+
+    #[test]
+    fn go_import_query_matches_go_get_one() {
+        assert!(query_wants_go_import("go-get=1"));
+        assert!(query_wants_go_import("foo=bar&go-get=1"));
+        assert!(!query_wants_go_import("go-get=0"));
+        assert!(!query_wants_go_import("go-get"));
+        assert!(!query_wants_go_import("at=https%3A%2F%2Fexample.com"));
+        assert!(!query_wants_go_import(""));
+    }
+
+    fn go_import_router() -> Router {
+        Router::new()
+            .route("/", get(|| async { "root" }))
+            .layer(middleware::from_fn(serve_go_import))
+    }
+
+    async fn body_text(response: Response) -> (StatusCode, String) {
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn serves_go_import_meta_for_module_root() {
+        let response = go_import_router()
+            .oneshot(
+                Request::builder()
+                    .uri("/?go-get=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, body) = body_text(response).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(r#"<meta name="go-import" content="cc.me git https://github.com/xmit-co/cc.me">"#));
+    }
+
+    #[tokio::test]
+    async fn serves_go_import_meta_for_unrouted_subpackage() {
+        // `go get cc.me/ccme` fetches /ccme?go-get=1, which has no route.
+        let response = go_import_router()
+            .oneshot(
+                Request::builder()
+                    .uri("/ccme?go-get=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, body) = body_text(response).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(r#"content="cc.me git"#));
+    }
+
+    #[tokio::test]
+    async fn passes_through_without_go_get() {
+        let response = go_import_router()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let (status, body) = body_text(response).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "root");
+    }
 
     #[test]
     fn trampoline_appends_oauth_params_to_target() {
