@@ -205,6 +205,22 @@
   ],
   <span class="tok-str">"body_b64u"</span>: <span class="tok-str">"e30"</span>
 }</code></pre>
+        <h3>Error handling</h3>
+        <p>
+          API errors use the response status plus a compact JSON body. Treat <code>5xx</code> as
+          retryable with backoff; treat <code>4xx</code> as a caller, auth, capacity, or provider
+          handshake problem to fix before retrying. Common cases are <code>401</code> for bad owner
+          signatures, <code>409</code> for full inboxes, and <code>413</code> for captures over
+          64 KiB.
+        </p>
+        <pre><code class="language-json">{
+  <span class="tok-str">"error"</span>: <span class="tok-str">"human-readable reason"</span>
+}</code></pre>
+        <p>
+          Forwarders should acknowledge only after local handling succeeds. If local handling fails
+          after a claim, call <code>release</code> or let claim recovery make the delivery ready
+          again.
+        </p>
       </section>
 
       <section id="clients">
@@ -260,13 +276,19 @@
   <span class="tok-prop">poll</span>: <span class="tok-bool">true</span>,
 });
 
+<span class="tok-kw">const</span> <span class="tok-id">claimed</span> = <span class="tok-id">requests</span>.<span class="tok-call">map</span>((<span class="tok-id">request</span>) => <span class="tok-id">request</span>.<span class="tok-prop">id</span>);
 <span class="tok-kw">const</span> <span class="tok-id">handled</span> = [];
-<span class="tok-kw">for</span> (<span class="tok-kw">const</span> <span class="tok-id">request</span> <span class="tok-kw">of</span> <span class="tok-id">requests</span>) {
-  <span class="tok-id">console</span>.<span class="tok-call">log</span>(<span class="tok-id">request</span>.<span class="tok-prop">method</span>, <span class="tok-id">request</span>.<span class="tok-prop">path</span>, <span class="tok-id">request</span>.<span class="tok-call">text</span>());
-  <span class="tok-id">handled</span>.<span class="tok-call">push</span>(<span class="tok-id">request</span>.<span class="tok-prop">id</span>);
-}
-
-<span class="tok-kw">await</span> <span class="tok-id">cc</span>.<span class="tok-call">ack</span>(<span class="tok-id">handled</span>);</code></pre>
+<span class="tok-kw">try</span> {
+  <span class="tok-kw">for</span> (<span class="tok-kw">const</span> <span class="tok-id">request</span> <span class="tok-kw">of</span> <span class="tok-id">requests</span>) {
+    <span class="tok-id">console</span>.<span class="tok-call">log</span>(<span class="tok-id">request</span>.<span class="tok-prop">method</span>, <span class="tok-id">request</span>.<span class="tok-prop">path</span>, <span class="tok-id">request</span>.<span class="tok-call">text</span>());
+    <span class="tok-id">handled</span>.<span class="tok-call">push</span>(<span class="tok-id">request</span>.<span class="tok-prop">id</span>);
+  }
+  <span class="tok-kw">await</span> <span class="tok-id">cc</span>.<span class="tok-call">ack</span>(<span class="tok-id">handled</span>);
+} <span class="tok-kw">catch</span> (<span class="tok-id">error</span>) {
+  <span class="tok-kw">const</span> <span class="tok-id">pending</span> = <span class="tok-id">claimed</span>.<span class="tok-call">filter</span>((<span class="tok-id">id</span>) => !<span class="tok-id">handled</span>.<span class="tok-call">includes</span>(<span class="tok-id">id</span>));
+  <span class="tok-kw">if</span> (<span class="tok-id">pending</span>.<span class="tok-prop">length</span>) <span class="tok-kw">await</span> <span class="tok-id">cc</span>.<span class="tok-call">release</span>(<span class="tok-id">pending</span>).<span class="tok-call">catch</span>(() => {});
+  <span class="tok-kw">throw</span> <span class="tok-id">error</span>;
+}</code></pre>
         <p>The <code>inspect</code> subcommand is JavaScript-only.</p>
 
         <h3>Python</h3>
@@ -280,11 +302,22 @@
 <span class="tok-call">print</span>(<span class="tok-id">alias</span>.<span class="tok-prop">url</span>)
 
 <span class="tok-id">cc</span> = <span class="tok-call">CcMeClient</span>(<span class="tok-prop">private_key</span>=<span class="tok-call">private_key</span>(<span class="tok-id">Path</span>.<span class="tok-call">home</span>() / <span class="tok-str">".cc-me.key"</span>))
+<span class="tok-id">batch</span> = <span class="tok-id">cc</span>.<span class="tok-call">claim</span>(<span class="tok-prop">limit</span>=<span class="tok-num">10</span>, <span class="tok-prop">poll</span>=<span class="tok-bool">True</span>)
+<span class="tok-id">claimed</span> = [<span class="tok-id">request</span>.<span class="tok-prop">id</span> <span class="tok-kw">for</span> <span class="tok-id">request</span> <span class="tok-kw">in</span> <span class="tok-id">batch</span>.<span class="tok-prop">requests</span>]
 <span class="tok-id">handled</span> = []
-<span class="tok-kw">for</span> <span class="tok-id">request</span> <span class="tok-kw">in</span> <span class="tok-id">cc</span>.<span class="tok-call">claim</span>(<span class="tok-prop">limit</span>=<span class="tok-num">10</span>, <span class="tok-prop">poll</span>=<span class="tok-bool">True</span>).<span class="tok-prop">requests</span>:
-    <span class="tok-call">print</span>(<span class="tok-id">request</span>.<span class="tok-prop">method</span>, <span class="tok-id">request</span>.<span class="tok-prop">path</span>, <span class="tok-id">request</span>.<span class="tok-call">text</span>())
-    <span class="tok-id">handled</span>.<span class="tok-call">append</span>(<span class="tok-id">request</span>.<span class="tok-prop">id</span>)
-<span class="tok-id">cc</span>.<span class="tok-call">ack</span>(<span class="tok-id">handled</span>)</code></pre>
+<span class="tok-kw">try</span>:
+    <span class="tok-kw">for</span> <span class="tok-id">request</span> <span class="tok-kw">in</span> <span class="tok-id">batch</span>.<span class="tok-prop">requests</span>:
+        <span class="tok-call">print</span>(<span class="tok-id">request</span>.<span class="tok-prop">method</span>, <span class="tok-id">request</span>.<span class="tok-prop">path</span>, <span class="tok-id">request</span>.<span class="tok-call">text</span>())
+        <span class="tok-id">handled</span>.<span class="tok-call">append</span>(<span class="tok-id">request</span>.<span class="tok-prop">id</span>)
+    <span class="tok-id">cc</span>.<span class="tok-call">ack</span>(<span class="tok-id">handled</span>)
+<span class="tok-kw">except</span> <span class="tok-id">Exception</span>:
+    <span class="tok-id">pending</span> = [<span class="tok-id">id</span> <span class="tok-kw">for</span> <span class="tok-id">id</span> <span class="tok-kw">in</span> <span class="tok-id">claimed</span> <span class="tok-kw">if</span> <span class="tok-id">id</span> <span class="tok-kw">not</span> <span class="tok-kw">in</span> <span class="tok-id">handled</span>]
+    <span class="tok-kw">if</span> <span class="tok-id">pending</span>:
+        <span class="tok-kw">try</span>:
+            <span class="tok-id">cc</span>.<span class="tok-call">release</span>(<span class="tok-id">pending</span>)
+        <span class="tok-kw">except</span> <span class="tok-id">Exception</span>:
+            <span class="tok-kw">pass</span>
+    <span class="tok-kw">raise</span></code></pre>
 
         <h3>Go</h3>
         <p>
@@ -294,22 +327,36 @@
         <pre><code class="language-sh"><span class="tok-call">go</span> <span class="tok-id">install</span> <span class="tok-str">cc.me@latest</span>
 <span class="tok-call">cc.me</span> <span class="tok-str">http://example.local:8080/webhook</span></code></pre>
         <p>The library lives at <code>cc.me/ccme</code>:</p>
-        <pre><code class="language-go"><span class="tok-kw">import</span> (
-    <span class="tok-str">"fmt"</span>
+        <pre><code class="language-go">import (
+    "fmt"
+    "log"
 
-    <span class="tok-id">ccme</span> <span class="tok-str">"cc.me/ccme"</span>
+    ccme "cc.me/ccme"
 )
 
-<span class="tok-id">key</span>, <span class="tok-id">_</span> := <span class="tok-id">ccme</span>.<span class="tok-call">PrivateKey</span>(<span class="tok-str">"/path/to/.cc-me.key"</span>)
-<span class="tok-id">cc</span>, <span class="tok-id">_</span> := <span class="tok-id">ccme</span>.<span class="tok-call">NewClient</span>(<span class="tok-str">""</span>, <span class="tok-id">key</span>)
+key, err := ccme.PrivateKey("/path/to/.cc-me.key")
+if err != nil { log.Fatal(err) }
+cc, err := ccme.NewClient("", key)
+if err != nil { log.Fatal(err) }
 
-<span class="tok-id">batch</span>, <span class="tok-id">_</span> := <span class="tok-id">cc</span>.<span class="tok-call">Claim</span>(<span class="tok-id">ccme</span>.<span class="tok-call">ClaimOptions</span>{<span class="tok-prop">Limit</span>: <span class="tok-num">10</span>, <span class="tok-prop">Poll</span>: <span class="tok-bool">true</span>})
-<span class="tok-kw">var</span> <span class="tok-id">handled</span> []<span class="tok-kw">string</span>
-<span class="tok-kw">for</span> <span class="tok-id">_</span>, <span class="tok-id">d</span> := <span class="tok-kw">range</span> <span class="tok-id">batch</span>.<span class="tok-prop">Requests</span> {
-    <span class="tok-id">fmt</span>.<span class="tok-call">Println</span>(<span class="tok-id">d</span>.<span class="tok-prop">Method</span>, <span class="tok-id">d</span>.<span class="tok-prop">Path</span>, <span class="tok-id">d</span>.<span class="tok-call">Text</span>())
-    <span class="tok-id">handled</span> = <span class="tok-call">append</span>(<span class="tok-id">handled</span>, <span class="tok-id">d</span>.<span class="tok-prop">ID</span>)
+batch, err := cc.Claim(ccme.ClaimOptions{Limit: 10, Poll: true})
+if err != nil { log.Fatal(err) }
+claimed := make([]string, 0, len(batch.Requests))
+var handled []string
+handle := func(d *ccme.Delivery) error {
+    fmt.Println(d.Method, d.Path, d.Text())
+    return nil
 }
-<span class="tok-id">cc</span>.<span class="tok-call">Ack</span>(<span class="tok-id">handled</span>)</code></pre>
+
+for _, d := range batch.Requests {
+    claimed = append(claimed, d.ID)
+    if err := handle(d); err != nil {
+        _, _ = cc.Release(claimed[len(handled):])
+        log.Fatal(err)
+    }
+    handled = append(handled, d.ID)
+}
+if _, err := cc.Ack(handled); err != nil { log.Fatal(err) }</code></pre>
 
         <h3>Rust</h3>
         <p>
@@ -319,40 +366,60 @@
         </p>
         <pre><code class="language-sh"><span class="tok-call">cargo</span> <span class="tok-id">install</span> <span class="tok-str">cc-me</span>
 <span class="tok-call">cc-me</span> <span class="tok-str">http://example.local:8080/webhook</span></code></pre>
-        <pre><code class="language-rs"><span class="tok-kw">use</span> <span class="tok-id">cc_me</span>::{<span class="tok-id">CcMeClient</span>, <span class="tok-id">ListOptions</span>, <span class="tok-id">private_key</span>};
-<span class="tok-kw">use</span> <span class="tok-id">std</span>::<span class="tok-id">path</span>::<span class="tok-id">Path</span>;
+        <pre><code class="language-rs">use cc_me::{CcMeClient, ListOptions, private_key};
+use std::path::Path;
 
-<span class="tok-kw">let</span> <span class="tok-id">key</span> = <span class="tok-call">private_key</span>(<span class="tok-id">Some</span>(<span class="tok-id">Path</span>::<span class="tok-call">new</span>(<span class="tok-str">"/path/to/.cc-me.key"</span>)))?;
-<span class="tok-kw">let</span> <span class="tok-id">cc</span> = <span class="tok-id">CcMeClient</span>::<span class="tok-call">new</span>(<span class="tok-id">key</span>, <span class="tok-id">None</span>)?;
+let key = private_key(Some(Path::new("/path/to/.cc-me.key")))?;
+let cc = CcMeClient::new(key, None)?;
 
-<span class="tok-kw">let</span> <span class="tok-id">batch</span> = <span class="tok-id">cc</span>.<span class="tok-call">claim</span>(&<span class="tok-id">ListOptions</span> { <span class="tok-prop">limit</span>: <span class="tok-id">Some</span>(<span class="tok-num">10</span>), <span class="tok-prop">poll</span>: <span class="tok-bool">true</span>, ..<span class="tok-id">Default</span>::<span class="tok-call">default</span>() })?;
-<span class="tok-kw">let</span> <span class="tok-kw">mut</span> <span class="tok-id">handled</span> = <span class="tok-id">Vec</span>::<span class="tok-call">new</span>();
-<span class="tok-kw">for</span> <span class="tok-id">d</span> <span class="tok-kw">in</span> &<span class="tok-id">batch</span>.<span class="tok-prop">requests</span> {
-    <span class="tok-call">println!</span>(<span class="tok-str">"{} {} {}"</span>, <span class="tok-id">d</span>.<span class="tok-prop">method</span>, <span class="tok-id">d</span>.<span class="tok-prop">path</span>, <span class="tok-id">d</span>.<span class="tok-call">text</span>());
-    <span class="tok-id">handled</span>.<span class="tok-call">push</span>(<span class="tok-id">d</span>.<span class="tok-prop">id</span>.<span class="tok-call">clone</span>());
+let batch = cc.claim(&amp;ListOptions { limit: Some(10), poll: true, ..Default::default() })?;
+let claimed: Vec&lt;_&gt; = batch.requests.iter().map(|d| d.id.clone()).collect();
+let mut handled = Vec::new();
+let handle = |d: &amp;cc_me::Delivery| -&gt; cc_me::Result&lt;()&gt; {
+    println!("{} {} {}", d.method, d.path, d.text());
+    Ok(())
+};
+
+for d in &amp;batch.requests {
+    if let Err(err) = handle(d) {
+        let _ = cc.release(&amp;claimed[handled.len()..]);
+        return Err(err);
+    }
+    handled.push(d.id.clone());
 }
-<span class="tok-id">cc</span>.<span class="tok-call">ack</span>(&<span class="tok-id">handled</span>)?;</code></pre>
+cc.ack(&amp;handled)?;</code></pre>
 
         <h3>Ruby</h3>
         <p>Install the gem (Ruby 3.0+, RbNaCl with libsodium), then forward:</p>
         <pre><code class="language-sh"><span class="tok-call">gem</span> <span class="tok-id">install</span> <span class="tok-str">cc-me</span>
 <span class="tok-call">cc-me</span> <span class="tok-str">http://example.local:8080/webhook</span></code></pre>
-        <pre><code class="language-rb"><span class="tok-call">require</span> <span class="tok-str">"cc_me"</span>
+        <pre><code class="language-rb">require "cc_me"
 
-<span class="tok-id">alias_url</span> = <span class="tok-id">CcMe</span>.<span class="tok-call">create_alias</span>(<span class="tok-str">"http://example.local/auth/callback"</span>)
-<span class="tok-call">puts</span> <span class="tok-id">alias_url</span>.<span class="tok-prop">url</span>
+alias_url = CcMe.create_alias("http://example.local/auth/callback")
+puts alias_url.url
 
-<span class="tok-id">key</span> = <span class="tok-id">CcMe</span>.<span class="tok-call">private_key</span>(<span class="tok-id">File</span>.<span class="tok-call">join</span>(<span class="tok-id">Dir</span>.<span class="tok-call">home</span>, <span class="tok-str">".cc-me.key"</span>))
-<span class="tok-id">cc</span> = <span class="tok-id">CcMe</span>::<span class="tok-id">Client</span>.<span class="tok-call">new</span>(<span class="tok-prop">private_key:</span> <span class="tok-id">key</span>)
+key = CcMe.private_key(File.join(Dir.home, ".cc-me.key"))
+cc = CcMe::Client.new(private_key: key)
 
-<span class="tok-call">puts</span> <span class="tok-id">cc</span>.<span class="tok-call">inbox_url</span>
+puts cc.inbox_url
 
-<span class="tok-id">handled</span> = []
-<span class="tok-id">cc</span>.<span class="tok-call">claim</span>(<span class="tok-prop">limit:</span> <span class="tok-num">10</span>, <span class="tok-prop">poll:</span> <span class="tok-bool">true</span>).<span class="tok-prop">requests</span>.<span class="tok-call">each</span> <span class="tok-kw">do</span> |<span class="tok-id">request</span>|
-  <span class="tok-call">puts</span> [<span class="tok-id">request</span>.<span class="tok-prop">method</span>, <span class="tok-id">request</span>.<span class="tok-prop">path</span>, <span class="tok-id">request</span>.<span class="tok-call">text</span>].<span class="tok-call">join</span>(<span class="tok-str">" "</span>)
-  <span class="tok-id">handled</span> &lt;&lt; <span class="tok-id">request</span>.<span class="tok-prop">id</span>
-<span class="tok-kw">end</span>
-<span class="tok-id">cc</span>.<span class="tok-call">ack</span>(<span class="tok-id">handled</span>)</code></pre>
+batch = cc.claim(limit: 10, poll: true)
+claimed = batch.requests.map(&amp;:id)
+handled = []
+begin
+  batch.requests.each do |request|
+    puts [request.method, request.path, request.text].join(" ")
+    handled &lt;&lt; request.id
+  end
+  cc.ack(handled)
+rescue
+  pending = claimed - handled
+  begin
+    cc.release(pending) unless pending.empty?
+  rescue
+  end
+  raise
+end</code></pre>
       </section>
 
       <section id="stats" class="stats">

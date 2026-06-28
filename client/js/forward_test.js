@@ -1,9 +1,56 @@
 import { assertEquals, assertMatch } from "jsr:@std/assert";
 
-import { forwardRequest, forwardUrl, headerList, hopByHopHeader } from "./forward.js";
+import {
+  UsageError,
+  forwardLoop,
+  forwardRequest,
+  forwardUrl,
+  headerList,
+  hopByHopHeader,
+  parseArgs,
+  usage,
+} from "./forward.js";
 import { readBody, startServer } from "./test_helpers.js";
 
 const encoder = new TextEncoder();
+
+// ---------------------------------------------------------------------------
+// CLI arguments
+// ---------------------------------------------------------------------------
+
+Deno.test("parseArgs: help is a command", () => {
+  assertEquals(parseArgs(["-h"]), { command: "help" });
+  assertEquals(parseArgs(["--help"]), { command: "help" });
+});
+
+Deno.test("parseArgs: parses forward URL and key", () => {
+  const options = parseArgs(["--key", "/tmp/k", "http://localhost:5100/slackorwhatever"]);
+  assertEquals(options.command, "forward");
+  assertEquals(options.keyFile, "/tmp/k");
+  assertEquals(options.target, "http://localhost:5100/slackorwhatever");
+});
+
+Deno.test("parseArgs: parses inspect port", () => {
+  const options = parseArgs(["inspect", "--port=9999"]);
+  assertEquals(options.command, "inspect");
+  assertEquals(options.port, 9999);
+});
+
+Deno.test("forwardLoop: missing URL is a usage error", async () => {
+  let error;
+  try {
+    await forwardLoop({ keyFile: "/tmp/k" });
+  } catch (err) {
+    error = err;
+  }
+  assertEquals(error instanceof UsageError, true);
+  assertEquals(error.message, "missing forward URL");
+});
+
+Deno.test("usage: includes forward and inspect forms", () => {
+  assertMatch(usage(), /cc-me .*<forward-url>/);
+  assertMatch(usage(), /cc-me inspect/);
+});
 
 // ---------------------------------------------------------------------------
 // hop-by-hop header classification

@@ -1,6 +1,6 @@
 {
   "name": "cc-me",
-  "version": "0.8.0",
+  "version": "0.8.2",
   "description": "JS client and CLI for cc.me",
   "bin": {
     "cc-me": "./forward.js"

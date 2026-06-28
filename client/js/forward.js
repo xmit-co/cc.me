@@ -1,7 +1,9 @@
 #!/usr/bin/env node
+import { realpathSync } from "node:fs";
 import { createServer } from "node:http";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { CcMeClient, privateKey } from "./index.js";
 
@@ -10,13 +12,13 @@ const DEFAULT_LIMIT = 10;
 const DEFAULT_INSPECT_PORT = 8765;
 const JSON_BODY_LIMIT = 1024 * 1024;
 
-function usage() {
-  console.error(`usage:
+export function usage() {
+  return `usage:
   cc-me [--key <path>] <forward-url>
-  cc-me inspect [--key <path>] [--port <port>]`);
+  cc-me inspect [--key <path>] [--port <port>]`;
 }
 
-function parseArgs(args) {
+export function parseArgs(args) {
   const options = {
     command: "forward",
     keyFile: process.env.CC_ME_KEY ?? DEFAULT_KEY_FILE,
@@ -28,8 +30,7 @@ function parseArgs(args) {
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
     if (arg === "--help" || arg === "-h") {
-      usage();
-      process.exit(0);
+      return { command: "help" };
     }
     if (arg === "--key" || arg === "--port") {
       i += 1;
@@ -141,8 +142,7 @@ export async function newClient(keyFile) {
 
 export async function forwardLoop({ keyFile, target }) {
   if (!target) {
-    usage();
-    process.exit(64);
+    throw new UsageError("missing forward URL");
   }
 
   const targetUrl = new URL(target);
@@ -525,21 +525,42 @@ fetch("/api/status").then((response) => response.json()).then((data) => {
 
 async function main() {
   const options = parseArgs(process.argv.slice(2));
-  if (options.command === "inspect") {
+  if (options.command === "help") {
+    console.log(usage());
+  } else if (options.command === "inspect") {
     await startInspector(options);
   } else {
     await forwardLoop(options);
   }
 }
 
-const isMain =
-  typeof process !== "undefined" &&
-  Array.isArray(process.argv) &&
-  import.meta.url === `file://${process.argv[1]}`;
+export class UsageError extends Error {}
 
-if (isMain) {
+// True when this module is the program entry point. `import.meta.main` covers
+// Deno, Bun, and Node >= 24; older Node falls back to comparing real paths,
+// which (unlike `file://${argv[1]}`) survives the symlink npm/npx creates in
+// node_modules/.bin, Windows drive letters, and paths with spaces.
+export function isMainModule() {
+  if (typeof import.meta.main === "boolean") {
+    return import.meta.main;
+  }
+  if (typeof process === "undefined" || !Array.isArray(process.argv) || !process.argv[1]) {
+    return false;
+  }
+  try {
+    return fileURLToPath(import.meta.url) === realpathSync(process.argv[1]);
+  } catch {
+    return false;
+  }
+}
+
+if (isMainModule()) {
   main().catch((error) => {
     console.error(error.message);
+    if (error instanceof UsageError) {
+      console.error(usage());
+      process.exit(64);
+    }
     process.exit(1);
   });
 }

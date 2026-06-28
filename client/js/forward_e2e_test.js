@@ -258,3 +258,67 @@ Deno.test("e2e CLI: forward.js binary claims, forwards, and acks", async () => {
     await Deno.remove(dir, { recursive: true });
   }
 });
+
+// Regression: npm/npx installs the bin as a symlink in node_modules/.bin, so
+// node sees process.argv[1] = the symlink while import.meta.url = the real
+// file. The old `import.meta.url === file://${argv[1]}` check failed that
+// comparison and the forwarder exited silently. Run forward.js through a
+// symlink under node and assert it actually starts forwarding.
+Deno.test("e2e CLI: forward.js runs through a symlink (node, npx-style)", async () => {
+  const items = [
+    sealedDelivery(KNOWN_SEED_BYTES, { id: "sym_1", method: "GET", query: "z=9", body: "" }),
+  ];
+  const { handler, log } = mockCcMe(items);
+  let claimsServed = 0;
+  const cc = await startServer(async (req, res) => {
+    if (req.url.endsWith("/claim")) {
+      claimsServed += 1;
+      if (claimsServed > 1) return; // stall subsequent long polls
+    }
+    return handler(req, res);
+  });
+
+  let targetHits = 0;
+  const target = await startServer((req, res) => {
+    targetHits += 1;
+    res.writeHead(200);
+    res.end("ok");
+  });
+
+  const dir = await Deno.makeTempDir();
+  const keyFile = `${dir}/cc-me.key`;
+  await Deno.writeTextFile(keyFile, `${KNOWN_SEED_B64U}\n`);
+  await Deno.chmod(keyFile, 0o600);
+
+  // Symlink in node_modules/.bin style: link -> real forward.js (absolute).
+  const realScript = new URL("./forward.js", import.meta.url).pathname;
+  const binLink = `${dir}/cc-me`;
+  await Deno.symlink(realScript, binLink);
+
+  const command = new Deno.Command("node", {
+    args: [binLink, "--key", keyFile, target.url],
+    env: { CC_ME_URL: cc.url, CC_ME_LIMIT: "10" },
+    stdout: "piped",
+    stderr: "piped",
+  });
+  const child = command.spawn();
+
+  try {
+    const deadline = Date.now() + 15000;
+    while (Date.now() < deadline && !(targetHits >= 1 && log.ack.includes("sym_1"))) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    assertEquals(targetHits >= 1, true);
+    assertEquals(log.ack.includes("sym_1"), true);
+  } finally {
+    try {
+      child.kill("SIGKILL");
+    } catch { /* already gone */ }
+    await child.status;
+    child.stdout.cancel().catch(() => {});
+    child.stderr.cancel().catch(() => {});
+    await cc.close();
+    await target.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
