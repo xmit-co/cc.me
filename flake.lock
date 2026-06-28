@@ -54,8 +54,7 @@
         "crane": "crane",
         "flake-utils": "flake-utils",
         "nixpkgs": "nixpkgs",
-        "rust-overlay": "rust-overlay",
-        "xmit": "xmit"
+        "rust-overlay": "rust-overlay"
       }
     },
     "rust-overlay": {
@@ -90,29 +89,6 @@
       "original": {
         "owner": "nix-systems",
         "repo": "default",
-        "type": "github"
-      }
-    },
-    "xmit": {
-      "inputs": {
-        "flake-utils": [
-          "flake-utils"
-        ],
-        "nixpkgs": [
-          "nixpkgs"
-        ]
-      },
-      "locked": {
-        "lastModified": 1770402790,
-        "narHash": "sha256-sBn7jytwgagk71WNVoq6l4S2Td3k2MFPoJRtM73tNCs=",
-        "owner": "xmit-co",
-        "repo": "xmit",
-        "rev": "bf7d9a3f16cbc750c0b98dcf9d418f68b0f17325",
-        "type": "github"
-      },
-      "original": {
-        "owner": "xmit-co",
-        "repo": "xmit",
         "type": "github"
       }
     }

@@ -1,5 +1,6 @@
 *.egg-info/
 *.pyc
 /.direnv/
+/.pgdata/
 node_modules/
 target/

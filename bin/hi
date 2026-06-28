@@ -1,0 +1,20 @@
+#!/usr/bin/env sh
+# bin/hi <address> — simulate a login e-mail to hi@cc.me from <address> and
+# print the reply that would be sent. Creates the magic link in the (dev) DB;
+# no e-mail is delivered. Override DATABASE_URL / CC_ME_PUBLIC_URL as needed.
+set -eu
+
+if [ "$#" -ne 1 ]; then
+  echo "usage: bin/hi <address>" >&2
+  exit 64
+fi
+
+cd "$(dirname "$0")/.."
+
+: "${DATABASE_URL:=postgres://cc_me@127.0.0.1:55432/cc_me}"
+: "${CC_ME_PUBLIC_URL:=http://localhost:3000}"
+export DATABASE_URL CC_ME_PUBLIC_URL
+export CC_ME_SMTP=-
+
+printf 'From: %s\nTo: hi@cc.me\nSubject: login\n\n' "$1" \
+  | cargo run --quiet --bin cc-me-mail -- hi@cc.me "$1"

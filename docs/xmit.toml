@@ -1,3 +1,0 @@
-[[headers]]
-name = "Content-Security-Policy"
-value = "frame-ancestors https://pcarrier.com"

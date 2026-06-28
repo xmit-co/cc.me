@@ -1,0 +1,427 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>cc.me docs</title>
+    <meta name="color-scheme" content="light dark" />
+    <meta name="go-import" content="cc.me git https://github.com/xmit-co/cc.me" />
+    <meta
+      name="go-source"
+      content="cc.me https://github.com/xmit-co/cc.me https://github.com/xmit-co/cc.me/tree/main{/dir} https://github.com/xmit-co/cc.me/blob/main{/dir}/{file}#L{line}"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header>
+      <span class="brand"><a href="/">cc.me</a> / HTTP</span>
+      <nav aria-label="Sections">
+        <a href="#use-cases">Use cases</a>
+        <a href="#oauth">OAuth</a>
+        <a href="#inbox">HTTP inbox</a>
+        <a href="#clients">Clients</a>
+      </nav>
+    </header>
+
+    <main>
+      <section class="intro">
+        <h1>HTTP.</h1>
+        <p>
+          OAuth callback trampolines and sealed webhook inboxes. cc.me redirects OAuth callbacks
+          to local targets and keeps webhook deliveries encrypted until you claim and acknowledge
+          them.
+        </p>
+      </section>
+
+      <section id="use-cases">
+        <h2>Use cases</h2>
+        <ul class="use-cases">
+          <li>
+            <strong>OAuth callbacks.</strong> Register one HTTPS redirect URI and trampoline
+            provider responses to local targets, preserving provider query parameters.
+          </li>
+          <li>
+            <strong>Stable aliases.</strong> Create reproducible <code>/c/...</code> URLs for
+            preview apps, branch environments, strict providers, and demos.
+          </li>
+          <li>
+            <strong>Encrypted webhooks.</strong> Capture, inspect, forward, claim, ack, release, or
+            fan out deliveries while they remain encrypted until claimed.
+          </li>
+          <li>
+            <strong>Integrations and tests.</strong> Answer common protocol handshakes, verify
+            provider signatures after decrypting, build private fixtures, or hand off offline
+            deliveries by sharing only the private key.
+          </li>
+        </ul>
+      </section>
+
+      <section id="oauth">
+        <h2>OAuth callbacks</h2>
+        <p>
+          Use <code>/</code> with an absolute <code>at</code> target. Every callback query parameter
+          except <code>at</code> is appended to the target.
+        </p>
+        <pre><code class="language-url"><span class="tok-proto">https://</span><span class="tok-host">cc.me</span><span class="tok-path">/</span><span class="tok-query">?at=</span><span class="tok-str">http%3A%2F%2Fexample.local%2Fauth%2Fcallback</span></code></pre>
+        <h3>Short aliases</h3>
+        <p>
+          Create a path-only callback URL when a provider wants a stable redirect URI. Reusing the
+          same target returns the same alias.
+        </p>
+        <pre><code class="language-http"><span class="tok-method">POST</span> <span class="tok-path">/c</span>
+
+{
+  <span class="tok-str">"at"</span>: <span class="tok-str">"http://example.local/auth/callback"</span>
+}</code></pre>
+        <pre><code class="language-json">{
+  <span class="tok-str">"url"</span>: <span class="tok-str">"https://cc.me/c/1cuEdvnPA31f"</span>
+}</code></pre>
+      </section>
+
+      <section id="inbox">
+        <h2>HTTP inbox</h2>
+        <p>
+          <code>/i/&lt;base64url-ed25519-public-key&gt;</code> is a tiny encrypted inbox.
+          <code>POST</code> stores a request encrypted for that key;
+          <code>POST /i/&lt;key-a&gt;.&lt;key-b&gt;</code> fans out one encrypted copy per recipient.
+        </p>
+        <pre><code class="language-http"><span class="tok-method">POST</span> <span class="tok-path">/i/xG72MCGkluShRByISwEzZVgjIUti3_7phnEch9PxJRI</span></code></pre>
+        <ul>
+          <li>
+            Inboxes hold 100 hooks by default. If any recipient inbox is full,
+            <code>POST</code> returns <code>409 {"error":"inbox is full"}</code> and leaves existing
+            deliveries alone.
+          </li>
+          <li>
+            Stored method, path, query, headers, and body must fit within 64 KiB; larger requests
+            are rejected. <code>GET</code> and claim responses include only as many items as fit
+            within 1 MiB.
+          </li>
+          <li>
+            <code>GET ?l=10&amp;p&amp;c=...</code> peeks without removing deliveries, caps the
+            batch, waits when empty, and uses the returned cursor to read newer deliveries.
+          </li>
+        </ul>
+        <h3>Protocol adapters</h3>
+        <p>
+          Adapters live below the inbox URL and answer provider handshakes before storing the full
+          request encrypted:
+          <code>/webmention</code>, <code>/websub</code>, <code>/slack</code>,
+          <code>/pingback</code>, <code>/meta</code>, <code>/cloudevents</code>, and
+          <code>/discord/&lt;app-public-key&gt;</code>.
+        </p>
+        <pre><code class="language-http"><span class="tok-method">POST</span> <span class="tok-path">/i/.../webmention</span>
+<span class="tok-prop">content-type</span>: <span class="tok-str">application/x-www-form-urlencoded</span>
+<span class="tok-query">source=https%3A%2F%2Fexample.com%2Fpost&amp;target=https%3A%2F%2Fexample.net%2Fpage</span></code></pre>
+        <pre><code class="language-http"><span class="tok-method">GET</span> <span class="tok-path">/i/.../websub</span><span class="tok-query">?hub.mode=subscribe&amp;hub.topic=...&amp;hub.challenge=abc</span>
+<span class="tok-method">POST</span> <span class="tok-path">/i/.../slack</span> { <span class="tok-str">"type"</span>: <span class="tok-str">"url_verification"</span>, <span class="tok-str">"challenge"</span>: <span class="tok-str">"3eZbr..."</span> }
+<span class="tok-method">POST</span> <span class="tok-path">/i/.../pingback</span> <span class="tok-str">&lt;methodCall&gt;&lt;methodName&gt;pingback.ping&lt;/methodName&gt;...&lt;/methodCall&gt;</span>
+<span class="tok-method">GET</span> <span class="tok-path">/i/.../meta</span><span class="tok-query">?v=secret&amp;hub.mode=subscribe&amp;hub.verify_token=secret&amp;hub.challenge=abc</span>
+<span class="tok-method">POST</span> <span class="tok-path">/i/.../cloudevents</span>
+<span class="tok-prop">ce-specversion</span>: <span class="tok-str">1.0</span>
+<span class="tok-prop">ce-id</span>: <span class="tok-str">evt_1</span>
+<span class="tok-prop">ce-source</span>: <span class="tok-str">https://example.com/source</span>
+<span class="tok-prop">ce-type</span>: <span class="tok-str">com.example.event</span>
+<span class="tok-prop">content-type</span>: <span class="tok-str">application/json</span> { <span class="tok-str">"ok"</span>: <span class="tok-bool">true</span> }
+<span class="tok-method">POST</span> <span class="tok-path">/i/.../discord/0123456789abcdef...</span>
+<span class="tok-prop">x-signature-ed25519</span>: <span class="tok-str">...</span>
+<span class="tok-prop">x-signature-timestamp</span>: <span class="tok-num">1781337600</span>
+<span class="tok-prop">content-type</span>: <span class="tok-str">application/json</span> { <span class="tok-str">"type"</span>: <span class="tok-num">1</span> }</code></pre>
+        <p>
+          Meta returns the plain <code>hub.challenge</code>. CloudEvents accepts binary HTTP mode and
+          structured JSON. Discord is verified before capture; <code>type: 1</code> returns
+          <code>{"type":1}</code>, and other valid interactions are stored with
+          <code>{"type":5}</code>.
+        </p>
+        <h3>Provider recipes</h3>
+        <p>
+          GitHub, GitLab, Stripe, and Shopify can use the plain inbox URL. After decrypting, verify
+          the raw <code>bodyBytes</code> with the provider headers before acting.
+        </p>
+        <ul>
+          <li><strong>GitHub:</strong> check <code>x-hub-signature-256</code>.</li>
+          <li>
+            <strong>GitLab:</strong> prefer Standard Webhooks headers <code>webhook-id</code>,
+            <code>webhook-timestamp</code>, and <code>webhook-signature</code>; older hooks may use
+            <code>x-gitlab-token</code>.
+          </li>
+          <li><strong>Stripe:</strong> check <code>stripe-signature</code>.</li>
+          <li><strong>Shopify:</strong> check <code>x-shopify-hmac-sha256</code>.</li>
+        </ul>
+        <h3>Delivery control</h3>
+        <p>
+          Claim reserves ready deliveries until you ack or release them. If a client disappears
+          after claiming, the service eventually makes the delivery ready again.
+        </p>
+        <ul>
+          <li>
+            <code>POST /claim</code> with <code>{"limit":10,"poll":true}</code> reserves a batch.
+          </li>
+          <li><code>POST /ack</code> with <code>{"ids":[...]}</code> removes handled deliveries.</li>
+          <li><code>POST /release</code> with <code>{"ids":[...]}</code> retries them immediately.</li>
+          <li>
+            Ack and release return <code>acked</code> or <code>released</code> counts plus
+            <code>missing</code> IDs.
+          </li>
+        </ul>
+        <h3>Owner authentication</h3>
+        <p>
+          <code>GET</code>, <code>claim</code>, <code>ack</code>, and <code>release</code> must prove
+          ownership of the inbox private key. Each request needs an
+          <code>x-cc-me-timestamp</code> header (Unix seconds) and an
+          <code>x-cc-me-signature</code> header containing a base64url Ed25519 signature of:
+        </p>
+        <pre><code class="language-text">cc-me-v1
+{METHOD}
+{PATH}
+{TIMESTAMP}
+{SHA256(BODY) base64url}</code></pre>
+        <p>The JS client adds these headers automatically.</p>
+        <h3>Responses</h3>
+        <pre><code class="language-http"><span class="tok-method">GET</span> <span class="tok-path">/i/xG72MCGkluShRByISwEzZVgjIUti3_7phnEch9PxJRI</span><span class="tok-query">?l=10&amp;p</span>
+<span class="tok-prop">x-cc-me-timestamp</span>: <span class="tok-num">1781337600</span>
+<span class="tok-prop">x-cc-me-signature</span>: <span class="tok-str">base64url-ed25519-signature</span></code></pre>
+        <pre><code class="language-json">{
+  <span class="tok-str">"count"</span>: <span class="tok-num">1</span>,
+  <span class="tok-str">"items"</span>: [
+    {
+      <span class="tok-str">"id"</span>: <span class="tok-str">"m_01k8v7xq7gx1a8p0g7nq0f"</span>,
+      <span class="tok-str">"sealed"</span>: <span class="tok-str">"base64url-encrypted-delivery"</span>
+    }
+  ],
+  <span class="tok-str">"cursor"</span>: <span class="tok-str">"opaque-cursor"</span>
+}</code></pre>
+        <p>Claim returns the same shape without <code>cursor</code>. Decrypted items have this shape:</p>
+        <pre><code class="language-json">{
+  <span class="tok-str">"id"</span>: <span class="tok-str">"m_01k8v7xq7gx1a8p0g7nq0f"</span>,
+  <span class="tok-str">"received_at_unix_ms"</span>: <span class="tok-num">1781337600000</span>,
+  <span class="tok-str">"method"</span>: <span class="tok-str">"POST"</span>,
+  <span class="tok-str">"path"</span>: <span class="tok-str">"/i/..."</span>,
+  <span class="tok-str">"query"</span>: <span class="tok-str">"source=github&amp;delivery=42"</span>,
+  <span class="tok-str">"headers"</span>: [
+    {
+      <span class="tok-str">"name"</span>: <span class="tok-str">"content-type"</span>,
+      <span class="tok-str">"value_b64u"</span>: <span class="tok-str">"YXBwbGljYXRpb24vanNvbg"</span>
+    }
+  ],
+  <span class="tok-str">"body_b64u"</span>: <span class="tok-str">"e30"</span>
+}</code></pre>
+        <h3>Error handling</h3>
+        <p>
+          API errors use the response status plus a compact JSON body. Treat <code>5xx</code> as
+          retryable with backoff; treat <code>4xx</code> as a caller, auth, capacity, or provider
+          handshake problem to fix before retrying. Common cases are <code>401</code> for bad owner
+          signatures, <code>409</code> for full inboxes, and <code>413</code> for captures over
+          64 KiB.
+        </p>
+        <pre><code class="language-json">{
+  <span class="tok-str">"error"</span>: <span class="tok-str">"human-readable reason"</span>
+}</code></pre>
+        <p>
+          Forwarders should acknowledge only after local handling succeeds. If local handling fails
+          after a claim, call <code>release</code> or let claim recovery make the delivery ready
+          again.
+        </p>
+      </section>
+
+      <section id="clients">
+        <h2>Clients</h2>
+        <p>
+          Client libraries build trampoline URLs and read inbox deliveries. The JavaScript,
+          Python, Go, Rust, and Ruby ports share one
+          <a href="https://github.com/xmit-co/cc.me/blob/main/client/PROTOCOL.md">wire protocol</a>,
+          and each ships a <code>cc-me</code> forwarder that claims deliveries and replays them to a
+          local endpoint. Keys are stored at <code>~/.cc-me.key</code> by default
+          (<code>--key</code> or <code>CC_ME_KEY</code> to override).
+        </p>
+
+        <h3>JavaScript</h3>
+        <p>
+          Forward an inbox to a local endpoint with the
+          <a href="https://www.npmjs.com/package/cc-me"><code>cc-me</code></a>
+          command:
+        </p>
+        <pre><code class="language-sh"><span class="tok-call">npx</span> <span class="tok-str">cc-me</span> <span class="tok-str">http://example.local:8080/webhook</span>
+<span class="tok-call">pnpx</span> <span class="tok-str">cc-me</span> <span class="tok-str">http://example.local:8080/webhook</span>
+<span class="tok-call">bunx</span> <span class="tok-str">cc-me</span> <span class="tok-str">http://example.local:8080/webhook</span>
+<span class="tok-call">deno</span> <span class="tok-id">run</span> <span class="tok-str">-A</span> <span class="tok-str">npm:cc-me</span> <span class="tok-str">http://example.local:8080/webhook</span></code></pre>
+        <p>Or inspect an inbox locally before acknowledging deliveries:</p>
+        <pre><code class="language-sh"><span class="tok-call">npx</span> <span class="tok-str">cc-me</span> <span class="tok-id">inspect</span>
+<span class="tok-call">pnpx</span> <span class="tok-str">cc-me</span> <span class="tok-id">inspect</span>
+<span class="tok-call">bunx</span> <span class="tok-str">cc-me</span> <span class="tok-id">inspect</span>
+<span class="tok-call">deno</span> <span class="tok-id">run</span> <span class="tok-str">-A</span> <span class="tok-str">npm:cc-me</span> <span class="tok-id">inspect</span></code></pre>
+        <p>
+          The forwarder persists and reuses <code>~/.cc-me.key</code> by default. Use
+          <code>--key</code> to choose a different key file:
+        </p>
+        <pre><code class="language-sh"><span class="tok-call">npx</span> <span class="tok-str">cc-me</span> <span class="tok-str">--key</span> <span class="tok-str">~/hooks.key</span> <span class="tok-str">http://example.local:8080/webhook</span></code></pre>
+        <p>
+          The ESM package works in browsers, Node.js, Bun, and Deno. In browsers,
+          <code>privateKey()</code> creates an in-memory key, or you can pass a stored key string.
+          In server runtimes, <code>privateKey(path)</code> creates and reuses a user-private key
+          file.
+        </p>
+        <pre><code class="language-js"><span class="tok-kw">import</span> { <span class="tok-id">homedir</span> } <span class="tok-kw">from</span> <span class="tok-str">"node:os"</span>;
+<span class="tok-kw">import</span> { <span class="tok-id">CcMeClient</span>, <span class="tok-id">createAlias</span>, <span class="tok-id">privateKey</span> } <span class="tok-kw">from</span> <span class="tok-str">"cc-me"</span>;
+
+<span class="tok-kw">const</span> <span class="tok-id">alias</span> = <span class="tok-kw">await</span> <span class="tok-call">createAlias</span>(<span class="tok-str">"http://example.local/auth/callback"</span>);
+<span class="tok-id">console</span>.<span class="tok-call">log</span>(<span class="tok-id">alias</span>.<span class="tok-prop">url</span>);
+
+<span class="tok-kw">const</span> <span class="tok-id">key</span> = <span class="tok-kw">await</span> <span class="tok-call">privateKey</span>(<span class="tok-str">`${homedir()}/.cc-me.key`</span>);
+<span class="tok-kw">const</span> <span class="tok-id">cc</span> = <span class="tok-kw">new</span> <span class="tok-call">CcMeClient</span>({ <span class="tok-prop">privateKey</span>: <span class="tok-id">key</span> });
+
+<span class="tok-id">console</span>.<span class="tok-call">log</span>(<span class="tok-kw">await</span> <span class="tok-id">cc</span>.<span class="tok-call">inboxUrl</span>());
+
+<span class="tok-kw">const</span> { <span class="tok-id">requests</span> } = <span class="tok-kw">await</span> <span class="tok-id">cc</span>.<span class="tok-call">claim</span>({
+  <span class="tok-prop">limit</span>: <span class="tok-num">10</span>,
+  <span class="tok-prop">poll</span>: <span class="tok-bool">true</span>,
+});
+
+<span class="tok-kw">const</span> <span class="tok-id">claimed</span> = <span class="tok-id">requests</span>.<span class="tok-call">map</span>((<span class="tok-id">request</span>) => <span class="tok-id">request</span>.<span class="tok-prop">id</span>);
+<span class="tok-kw">const</span> <span class="tok-id">handled</span> = [];
+<span class="tok-kw">try</span> {
+  <span class="tok-kw">for</span> (<span class="tok-kw">const</span> <span class="tok-id">request</span> <span class="tok-kw">of</span> <span class="tok-id">requests</span>) {
+    <span class="tok-id">console</span>.<span class="tok-call">log</span>(<span class="tok-id">request</span>.<span class="tok-prop">method</span>, <span class="tok-id">request</span>.<span class="tok-prop">path</span>, <span class="tok-id">request</span>.<span class="tok-call">text</span>());
+    <span class="tok-id">handled</span>.<span class="tok-call">push</span>(<span class="tok-id">request</span>.<span class="tok-prop">id</span>);
+  }
+  <span class="tok-kw">await</span> <span class="tok-id">cc</span>.<span class="tok-call">ack</span>(<span class="tok-id">handled</span>);
+} <span class="tok-kw">catch</span> (<span class="tok-id">error</span>) {
+  <span class="tok-kw">const</span> <span class="tok-id">pending</span> = <span class="tok-id">claimed</span>.<span class="tok-call">filter</span>((<span class="tok-id">id</span>) => !<span class="tok-id">handled</span>.<span class="tok-call">includes</span>(<span class="tok-id">id</span>));
+  <span class="tok-kw">if</span> (<span class="tok-id">pending</span>.<span class="tok-prop">length</span>) <span class="tok-kw">await</span> <span class="tok-id">cc</span>.<span class="tok-call">release</span>(<span class="tok-id">pending</span>).<span class="tok-call">catch</span>(() => {});
+  <span class="tok-kw">throw</span> <span class="tok-id">error</span>;
+}</code></pre>
+        <p>The <code>inspect</code> subcommand is JavaScript-only.</p>
+
+        <h3>Python</h3>
+        <p>Install from PyPI (Python 3.10+, PyNaCl), then forward:</p>
+        <pre><code class="language-sh"><span class="tok-call">pip</span> <span class="tok-id">install</span> <span class="tok-str">cc-me</span>
+<span class="tok-call">cc-me</span> <span class="tok-str">http://example.local:8080/webhook</span></code></pre>
+        <pre><code class="language-py"><span class="tok-kw">from</span> <span class="tok-id">pathlib</span> <span class="tok-kw">import</span> <span class="tok-id">Path</span>
+<span class="tok-kw">from</span> <span class="tok-id">cc_me</span> <span class="tok-kw">import</span> <span class="tok-id">CcMeClient</span>, <span class="tok-id">create_alias</span>, <span class="tok-id">private_key</span>
+
+<span class="tok-id">alias</span> = <span class="tok-call">create_alias</span>(<span class="tok-str">"http://example.local/auth/callback"</span>)
+<span class="tok-call">print</span>(<span class="tok-id">alias</span>.<span class="tok-prop">url</span>)
+
+<span class="tok-id">cc</span> = <span class="tok-call">CcMeClient</span>(<span class="tok-prop">private_key</span>=<span class="tok-call">private_key</span>(<span class="tok-id">Path</span>.<span class="tok-call">home</span>() / <span class="tok-str">".cc-me.key"</span>))
+<span class="tok-id">batch</span> = <span class="tok-id">cc</span>.<span class="tok-call">claim</span>(<span class="tok-prop">limit</span>=<span class="tok-num">10</span>, <span class="tok-prop">poll</span>=<span class="tok-bool">True</span>)
+<span class="tok-id">claimed</span> = [<span class="tok-id">request</span>.<span class="tok-prop">id</span> <span class="tok-kw">for</span> <span class="tok-id">request</span> <span class="tok-kw">in</span> <span class="tok-id">batch</span>.<span class="tok-prop">requests</span>]
+<span class="tok-id">handled</span> = []
+<span class="tok-kw">try</span>:
+    <span class="tok-kw">for</span> <span class="tok-id">request</span> <span class="tok-kw">in</span> <span class="tok-id">batch</span>.<span class="tok-prop">requests</span>:
+        <span class="tok-call">print</span>(<span class="tok-id">request</span>.<span class="tok-prop">method</span>, <span class="tok-id">request</span>.<span class="tok-prop">path</span>, <span class="tok-id">request</span>.<span class="tok-call">text</span>())
+        <span class="tok-id">handled</span>.<span class="tok-call">append</span>(<span class="tok-id">request</span>.<span class="tok-prop">id</span>)
+    <span class="tok-id">cc</span>.<span class="tok-call">ack</span>(<span class="tok-id">handled</span>)
+<span class="tok-kw">except</span> <span class="tok-id">Exception</span>:
+    <span class="tok-id">pending</span> = [<span class="tok-id">id</span> <span class="tok-kw">for</span> <span class="tok-id">id</span> <span class="tok-kw">in</span> <span class="tok-id">claimed</span> <span class="tok-kw">if</span> <span class="tok-id">id</span> <span class="tok-kw">not</span> <span class="tok-kw">in</span> <span class="tok-id">handled</span>]
+    <span class="tok-kw">if</span> <span class="tok-id">pending</span>:
+        <span class="tok-kw">try</span>:
+            <span class="tok-id">cc</span>.<span class="tok-call">release</span>(<span class="tok-id">pending</span>)
+        <span class="tok-kw">except</span> <span class="tok-id">Exception</span>:
+            <span class="tok-kw">pass</span>
+    <span class="tok-kw">raise</span></code></pre>
+
+        <h3>Go</h3>
+        <p>
+          Install the forwarder from the <code>cc.me</code> vanity path; the server answers the
+          <code>go-import</code> handshake, so the installed binary is named <code>cc.me</code>:
+        </p>
+        <pre><code class="language-sh"><span class="tok-call">go</span> <span class="tok-id">install</span> <span class="tok-str">cc.me@latest</span>
+<span class="tok-call">cc.me</span> <span class="tok-str">http://example.local:8080/webhook</span></code></pre>
+        <p>The library lives at <code>cc.me/ccme</code>:</p>
+        <pre><code class="language-go"><span class="tok-kw">import</span> (
+    <span class="tok-str">"fmt"</span>
+    <span class="tok-str">"log"</span>
+
+    <span class="tok-id">ccme</span> <span class="tok-str">"cc.me/ccme"</span>
+)
+
+<span class="tok-id">key</span>, <span class="tok-id">err</span> := <span class="tok-id">ccme</span>.<span class="tok-call">PrivateKey</span>(<span class="tok-str">"/path/to/.cc-me.key"</span>)
+<span class="tok-kw">if</span> <span class="tok-id">err</span> != <span class="tok-kw">nil</span> { <span class="tok-id">log</span>.<span class="tok-call">Fatal</span>(<span class="tok-id">err</span>) }
+<span class="tok-id">cc</span>, <span class="tok-id">err</span> := <span class="tok-id">ccme</span>.<span class="tok-call">NewClient</span>(<span class="tok-str">""</span>, <span class="tok-id">key</span>)
+<span class="tok-kw">if</span> <span class="tok-id">err</span> != <span class="tok-kw">nil</span> { <span class="tok-id">log</span>.<span class="tok-call">Fatal</span>(<span class="tok-id">err</span>) }
+
+<span class="tok-id">batch</span>, <span class="tok-id">err</span> := <span class="tok-id">cc</span>.<span class="tok-call">Claim</span>(<span class="tok-id">ccme</span>.<span class="tok-id">ClaimOptions</span>{<span class="tok-prop">Limit</span>: <span class="tok-num">10</span>, <span class="tok-prop">Poll</span>: <span class="tok-bool">true</span>})
+<span class="tok-kw">if</span> <span class="tok-id">err</span> != <span class="tok-kw">nil</span> { <span class="tok-id">log</span>.<span class="tok-call">Fatal</span>(<span class="tok-id">err</span>) }
+<span class="tok-id">claimed</span> := <span class="tok-call">make</span>([]<span class="tok-kw">string</span>, <span class="tok-num">0</span>, <span class="tok-call">len</span>(<span class="tok-id">batch</span>.<span class="tok-prop">Requests</span>))
+<span class="tok-kw">var</span> <span class="tok-id">handled</span> []<span class="tok-kw">string</span>
+<span class="tok-id">handle</span> := <span class="tok-kw">func</span>(<span class="tok-id">d</span> *<span class="tok-id">ccme</span>.<span class="tok-id">Delivery</span>) <span class="tok-kw">error</span> {
+    <span class="tok-id">fmt</span>.<span class="tok-call">Println</span>(<span class="tok-id">d</span>.<span class="tok-prop">Method</span>, <span class="tok-id">d</span>.<span class="tok-prop">Path</span>, <span class="tok-id">d</span>.<span class="tok-call">Text</span>())
+    <span class="tok-kw">return</span> <span class="tok-kw">nil</span>
+}
+
+<span class="tok-kw">for</span> <span class="tok-id">_</span>, <span class="tok-id">d</span> := <span class="tok-kw">range</span> <span class="tok-id">batch</span>.<span class="tok-prop">Requests</span> {
+    <span class="tok-id">claimed</span> = <span class="tok-call">append</span>(<span class="tok-id">claimed</span>, <span class="tok-id">d</span>.<span class="tok-prop">ID</span>)
+    <span class="tok-kw">if</span> <span class="tok-id">err</span> := <span class="tok-call">handle</span>(<span class="tok-id">d</span>); <span class="tok-id">err</span> != <span class="tok-kw">nil</span> {
+        <span class="tok-id">_</span>, <span class="tok-id">_</span> = <span class="tok-id">cc</span>.<span class="tok-call">Release</span>(<span class="tok-id">claimed</span>[<span class="tok-call">len</span>(<span class="tok-id">handled</span>):])
+        <span class="tok-id">log</span>.<span class="tok-call">Fatal</span>(<span class="tok-id">err</span>)
+    }
+    <span class="tok-id">handled</span> = <span class="tok-call">append</span>(<span class="tok-id">handled</span>, <span class="tok-id">d</span>.<span class="tok-prop">ID</span>)
+}
+<span class="tok-kw">if</span> <span class="tok-id">_</span>, <span class="tok-id">err</span> := <span class="tok-id">cc</span>.<span class="tok-call">Ack</span>(<span class="tok-id">handled</span>); <span class="tok-id">err</span> != <span class="tok-kw">nil</span> { <span class="tok-id">log</span>.<span class="tok-call">Fatal</span>(<span class="tok-id">err</span>) }</code></pre>
+
+        <h3>Rust</h3>
+        <p>
+          Install the <code>cc-me</code> binary, or add the
+          <a href="https://crates.io/crates/cc-me"><code>cc-me</code></a> crate with
+          <code>cargo add cc-me</code>:
+        </p>
+        <pre><code class="language-sh"><span class="tok-call">cargo</span> <span class="tok-id">install</span> <span class="tok-str">cc-me</span>
+<span class="tok-call">cc-me</span> <span class="tok-str">http://example.local:8080/webhook</span></code></pre>
+        <pre><code class="language-rs"><span class="tok-kw">use</span> <span class="tok-id">cc_me</span>::{<span class="tok-id">CcMeClient</span>, <span class="tok-id">ListOptions</span>, <span class="tok-call">private_key</span>};
+<span class="tok-kw">use</span> <span class="tok-id">std</span>::<span class="tok-id">path</span>::<span class="tok-id">Path</span>;
+
+<span class="tok-kw">let</span> <span class="tok-id">key</span> = <span class="tok-call">private_key</span>(<span class="tok-id">Some</span>(<span class="tok-id">Path</span>::<span class="tok-call">new</span>(<span class="tok-str">"/path/to/.cc-me.key"</span>)))?;
+<span class="tok-kw">let</span> <span class="tok-id">cc</span> = <span class="tok-id">CcMeClient</span>::<span class="tok-call">new</span>(<span class="tok-id">key</span>, <span class="tok-id">None</span>)?;
+
+<span class="tok-kw">let</span> <span class="tok-id">batch</span> = <span class="tok-id">cc</span>.<span class="tok-call">claim</span>(&amp;<span class="tok-id">ListOptions</span> { <span class="tok-prop">limit</span>: <span class="tok-id">Some</span>(<span class="tok-num">10</span>), <span class="tok-prop">poll</span>: <span class="tok-bool">true</span>, ..<span class="tok-id">Default</span>::<span class="tok-call">default</span>() })?;
+<span class="tok-kw">let</span> <span class="tok-id">claimed</span>: <span class="tok-id">Vec</span>&lt;_&gt; = <span class="tok-id">batch</span>.<span class="tok-prop">requests</span>.<span class="tok-call">iter</span>().<span class="tok-call">map</span>(|<span class="tok-id">d</span>| <span class="tok-id">d</span>.<span class="tok-prop">id</span>.<span class="tok-call">clone</span>()).<span class="tok-call">collect</span>();
+<span class="tok-kw">let</span> <span class="tok-kw">mut</span> <span class="tok-id">handled</span> = <span class="tok-id">Vec</span>::<span class="tok-call">new</span>();
+<span class="tok-kw">let</span> <span class="tok-id">handle</span> = |<span class="tok-id">d</span>: &amp;<span class="tok-id">cc_me</span>::<span class="tok-id">Delivery</span>| -&gt; <span class="tok-id">cc_me</span>::<span class="tok-id">Result</span>&lt;()&gt; {
+    <span class="tok-call">println!</span>(<span class="tok-str">"{} {} {}"</span>, <span class="tok-id">d</span>.<span class="tok-prop">method</span>, <span class="tok-id">d</span>.<span class="tok-prop">path</span>, <span class="tok-id">d</span>.<span class="tok-call">text</span>());
+    <span class="tok-id">Ok</span>(())
+};
+
+<span class="tok-kw">for</span> <span class="tok-id">d</span> <span class="tok-kw">in</span> &amp;<span class="tok-id">batch</span>.<span class="tok-prop">requests</span> {
+    <span class="tok-kw">if</span> <span class="tok-kw">let</span> <span class="tok-id">Err</span>(<span class="tok-id">err</span>) = <span class="tok-call">handle</span>(<span class="tok-id">d</span>) {
+        <span class="tok-kw">let</span> <span class="tok-id">_</span> = <span class="tok-id">cc</span>.<span class="tok-call">release</span>(&amp;<span class="tok-id">claimed</span>[<span class="tok-id">handled</span>.<span class="tok-call">len</span>()..]);
+        <span class="tok-kw">return</span> <span class="tok-id">Err</span>(<span class="tok-id">err</span>);
+    }
+    <span class="tok-id">handled</span>.<span class="tok-call">push</span>(<span class="tok-id">d</span>.<span class="tok-prop">id</span>.<span class="tok-call">clone</span>());
+}
+<span class="tok-id">cc</span>.<span class="tok-call">ack</span>(&amp;<span class="tok-id">handled</span>)?;</code></pre>
+
+        <h3>Ruby</h3>
+        <p>Install the gem (Ruby 3.0+, RbNaCl with libsodium), then forward:</p>
+        <pre><code class="language-sh"><span class="tok-call">gem</span> <span class="tok-id">install</span> <span class="tok-str">cc-me</span>
+<span class="tok-call">cc-me</span> <span class="tok-str">http://example.local:8080/webhook</span></code></pre>
+        <pre><code class="language-rb"><span class="tok-call">require</span> <span class="tok-str">"cc_me"</span>
+
+<span class="tok-id">alias_url</span> = <span class="tok-id">CcMe</span>.<span class="tok-call">create_alias</span>(<span class="tok-str">"http://example.local/auth/callback"</span>)
+<span class="tok-call">puts</span> <span class="tok-id">alias_url</span>.<span class="tok-prop">url</span>
+
+<span class="tok-id">key</span> = <span class="tok-id">CcMe</span>.<span class="tok-call">private_key</span>(<span class="tok-id">File</span>.<span class="tok-call">join</span>(<span class="tok-id">Dir</span>.<span class="tok-call">home</span>, <span class="tok-str">".cc-me.key"</span>))
+<span class="tok-id">cc</span> = <span class="tok-id">CcMe</span>::<span class="tok-id">Client</span>.<span class="tok-call">new</span>(<span class="tok-prop">private_key:</span> <span class="tok-id">key</span>)
+
+<span class="tok-call">puts</span> <span class="tok-id">cc</span>.<span class="tok-call">inbox_url</span>
+
+<span class="tok-id">batch</span> = <span class="tok-id">cc</span>.<span class="tok-call">claim</span>(<span class="tok-prop">limit:</span> <span class="tok-num">10</span>, <span class="tok-prop">poll:</span> <span class="tok-bool">true</span>)
+<span class="tok-id">claimed</span> = <span class="tok-id">batch</span>.<span class="tok-prop">requests</span>.<span class="tok-call">map</span>(&amp;<span class="tok-str">:id</span>)
+<span class="tok-id">handled</span> = []
+<span class="tok-kw">begin</span>
+  <span class="tok-id">batch</span>.<span class="tok-prop">requests</span>.<span class="tok-call">each</span> <span class="tok-kw">do</span> |<span class="tok-id">request</span>|
+    <span class="tok-call">puts</span> [<span class="tok-id">request</span>.<span class="tok-prop">method</span>, <span class="tok-id">request</span>.<span class="tok-prop">path</span>, <span class="tok-id">request</span>.<span class="tok-call">text</span>].<span class="tok-call">join</span>(<span class="tok-str">" "</span>)
+    <span class="tok-id">handled</span> &lt;&lt; <span class="tok-id">request</span>.<span class="tok-prop">id</span>
+  <span class="tok-kw">end</span>
+  <span class="tok-id">cc</span>.<span class="tok-call">ack</span>(<span class="tok-id">handled</span>)
+<span class="tok-kw">rescue</span>
+  <span class="tok-id">pending</span> = <span class="tok-id">claimed</span> - <span class="tok-id">handled</span>
+  <span class="tok-kw">begin</span>
+    <span class="tok-id">cc</span>.<span class="tok-call">release</span>(<span class="tok-id">pending</span>) <span class="tok-kw">unless</span> <span class="tok-id">pending</span>.<span class="tok-call">empty?</span>
+  <span class="tok-kw">rescue</span>
+  <span class="tok-kw">end</span>
+  <span class="tok-kw">raise</span>
+<span class="tok-kw">end</span></code></pre>
+      </section>
+    </main>
+  </body>
+</html>

@@ -9,16 +9,9 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     crane.url = "github:ipetkov/crane";
-    xmit = {
-      url = "github:xmit-co/xmit";
-      inputs = {
-        nixpkgs.follows = "nixpkgs";
-        flake-utils.follows = "flake-utils";
-      };
-    };
   };
 
-  outputs = { self, nixpkgs, flake-utils, rust-overlay, crane, xmit }:
+  outputs = { self, nixpkgs, flake-utils, rust-overlay, crane }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs {
@@ -58,6 +51,7 @@
           packages = [
             rustToolchain
             pkgs.cargo-llvm-cov
+            pkgs.cargo-watch
             pkgs.postgresql
             pkgs.process-compose
             pkgs.nodejs
@@ -68,7 +62,6 @@
             (pkgs.python3.withPackages (ps: [ ps.pynacl ]))
             pkgs.ruby
             pkgs.libsodium
-            xmit.packages.${system}.default
           ];
         };
       });

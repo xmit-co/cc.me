@@ -23,7 +23,7 @@ processes:
   postgres:
     command: |
       set -eu
-      exec postgres -D .pgdata -p 55432 -h 127.0.0.1
+      exec postgres -D .pgdata -p 55432 -h 127.0.0.1 -k "$PWD/.pgdata"
     shutdown:
       signal: 2
       timeout_seconds: 10
@@ -47,7 +47,7 @@ processes:
       restart: "no"
 
   cc-me:
-    command: cargo run
+    command: cargo watch -w src -w Cargo.toml -w docs -x run
     depends_on:
       db:
         condition: process_completed_successfully

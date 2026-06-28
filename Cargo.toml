@@ -3,6 +3,7 @@ name = "cc-me"
 version = "0.2.0"
 edition = "2024"
 license = "MIT"
+default-run = "cc-me"
 
 [dependencies]
 axum = "0.8.9"

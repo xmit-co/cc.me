@@ -15,8 +15,8 @@ use axum::{
     extract::{DefaultBodyLimit, Path, RawQuery, Request, State},
     http::{HeaderMap, Method, StatusCode, Uri, header},
     middleware::{self, Next},
-    response::{IntoResponse, Response},
-    routing::{get, post},
+    response::{Html, IntoResponse, Response},
+    routing::{delete, get, post},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use crypto_box::{
@@ -24,11 +24,11 @@ use crypto_box::{
     aead::rand_core::{OsRng, TryRngCore},
 };
 use curve25519_dalek::edwards::CompressedEdwardsY;
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 #[cfg(test)]
 use ed25519_dalek::SigningKey;
-use sha2::{Digest, Sha256};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlx::{
     PgPool, Row,
     postgres::{PgListener, PgPoolOptions},
@@ -47,7 +47,12 @@ const AUTH_SIGNATURE_HEADER: &str = "x-cc-me-signature";
 const AUTH_TIMESTAMP_HEADER: &str = "x-cc-me-timestamp";
 const AUTH_VERSION: &str = "cc-me-v1";
 const AUTH_WINDOW_SECONDS: u64 = 5 * 60;
-const DOCS_REDIRECT: &str = "https://www.cc.me/";
+const DOCS_INDEX_HTML: &str = include_str!("../docs/index.html");
+const DOCS_HTTP_HTML: &str = include_str!("../docs/http.html");
+const DOCS_STYLES_CSS: &str = include_str!("../docs/styles.css");
+const DOCS_CSP: &str = "frame-ancestors https://pcarrier.com";
+const EMAIL_ALIAS_DOMAIN: &str = "cc.me";
+const EMAIL_KEY_BYTES: usize = 32;
 const GO_IMPORT_HTML: &str = concat!(
     "<!doctype html>\n",
     "<meta name=\"go-import\" content=\"cc.me git https://github.com/xmit-co/cc.me\">\n",
@@ -55,6 +60,340 @@ const GO_IMPORT_HTML: &str = concat!(
     "https://github.com/xmit-co/cc.me/tree/main{/dir} ",
     "https://github.com/xmit-co/cc.me/blob/main{/dir}/{file}#L{line}\">\n",
 );
+const EMAIL_PAGE_HTML: &str = r#"<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cc.me email aliases</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --b: #fff;
+    --f: #181a1f;
+    --m: #5d6470;
+    --l: #d8dde5;
+    --c: #f5f7fa;
+    --a: #155eef;
+    --bad: #b42318;
+    font-family: system-ui, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --b: #101114;
+      --f: #eceff3;
+      --m: #a9b0bb;
+      --l: #30343b;
+      --c: #1c1f25;
+      --a: #8ab4ff;
+      --bad: #fda29b;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--b); color: var(--f); }
+  header, main { max-width: 58em; margin-inline: auto; padding-inline: 1rem; }
+  header { display: flex; justify-content: space-between; align-items: center; gap: 1.5rem; padding-block: 1.125rem; border-bottom: 1px solid var(--l); }
+  .brand { font-weight: 700; color: var(--f); text-decoration: none; }
+  h2 { margin: 0; font-size: 1.15rem; }
+  p { margin: 0; color: var(--m); line-height: 1.55; }
+  a { color: var(--a); }
+  main { display: grid; gap: 2rem; padding-block: 2.75rem 4.5rem; }
+  section { display: grid; gap: 1rem; align-content: start; }
+  input, button { font: inherit; }
+  form { display: flex; align-items: stretch; gap: .5rem; }
+  .field { display: flex; flex: 1; min-width: 0; border: 1px solid var(--l); border-radius: .375rem; overflow: hidden; background: var(--b); }
+  input { flex: 1; min-width: 0; border: 0; padding: .625rem .75rem; background: transparent; color: var(--f); }
+  .expiry { display: flex; align-items: center; gap: .4rem; color: var(--m); white-space: nowrap; font-size: .875rem; }
+  .expiry input:not([type=checkbox]) { flex: 0 0 auto; width: auto; border: 1px solid var(--l); border-radius: .375rem; background: var(--b); color: var(--f); padding: .35rem .4rem; }
+  .expiry input[type=checkbox] { flex: 0 0 auto; width: auto; padding: 0; margin: 0; }
+  .actions { display: flex; align-items: center; gap: .75rem; }
+  #logout { flex: 0 0 auto; width: auto; }
+  .suffix { display: flex; align-items: center; padding: 0 .75rem; border-left: 1px solid var(--l); color: var(--m); background: var(--c); }
+  button { padding: .625rem .875rem; border: 1px solid var(--l); border-radius: .375rem; background: var(--c); color: var(--f); cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--a); }
+  button:disabled, input:disabled { cursor: not-allowed; opacity: .55; }
+  ul { margin: 0; padding: 0; list-style: none; display: grid; gap: 1rem; }
+  li { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+  code { background: var(--c); padding: .125rem .375rem; border-radius: .25rem; font-family: ui-monospace, monospace; }
+  .meta { display: block; margin-top: .25rem; color: var(--m); font-size: .875rem; }
+  .empty { color: var(--m); }
+  .status { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: .75rem .875rem; border: 1px solid var(--l); border-radius: .375rem; background: var(--c); }
+  .error { color: var(--bad); }
+  .hidden { display: none; }
+  .spinner { display: inline-block; width: 1em; height: 1em; margin-right: .5em; vertical-align: -.15em; border: 2px solid var(--l); border-top-color: var(--a); border-radius: 50%; animation: spin .7s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @media (max-width: 36rem) {
+    form, li { display: block; }
+    button { margin-top: .5rem; width: 100%; }
+  }
+</style>
+<header>
+  <span class="brand"><a href="/">cc.me</a> / E-mail</span>
+</header>
+<main>
+  <noscript><p class="status error">JavaScript is required to manage your cc.me aliases.</p></noscript>
+  <div id="status" class="status">
+    <span id="status-text"><span class="spinner"></span>Loading…</span>
+    <button type="button" id="logout" class="hidden">Log out</button>
+  </div>
+  <section id="aliases-section">
+    <h2>Aliases</h2>
+    <p>Create <code>@cc.me</code> email addresses that forward to your inbox.</p>
+    <form id="create">
+      <span class="field">
+        <input id="alias" autocomplete="off" autofocus placeholder="alias" minlength="4">
+        <span class="suffix">@cc.me</span>
+      </span>
+      <button disabled>Create</button>
+      <button type="button" id="random">Random</button>
+    </form>
+    <p id="alias-error" class="error hidden"></p>
+    <ul id="aliases"></ul>
+  </section>
+  <section id="links-section">
+    <h2>Magic links</h2>
+    <p>Invalidate old links you no longer use.</p>
+    <ul id="links"></ul>
+  </section>
+</main>
+<script>
+const STORAGE_KEY = "cc-me-code";
+let key = new URLSearchParams(location.hash.slice(1)).get("code");
+try {
+  if (key) localStorage.setItem(STORAGE_KEY, key);
+  else key = localStorage.getItem(STORAGE_KEY);
+} catch (error) {}
+if (location.hash) history.replaceState(null, "", location.pathname + location.search);
+const status = document.getElementById("status");
+const statusText = document.getElementById("status-text");
+const aliases = document.getElementById("aliases");
+const links = document.getElementById("links");
+const form = document.getElementById("create");
+const input = document.getElementById("alias");
+const createButton = form.querySelector("button");
+const randomButton = document.getElementById("random");
+const aliasError = document.getElementById("alias-error");
+const aliasesSection = document.getElementById("aliases-section");
+const linksSection = document.getElementById("links-section");
+const logoutButton = document.getElementById("logout");
+
+input.addEventListener("input", () => {
+  createButton.disabled = !input.value.trim();
+});
+
+async function api(path, body, method = "POST") {
+  const response = await fetch(path, {
+    method,
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ key, ...body }),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(data.error || `HTTP ${response.status}`);
+    error.status = response.status;
+    throw error;
+  }
+  return data;
+}
+
+function setLoading(message) {
+  status.className = "status";
+  statusText.innerHTML = `<span class="spinner"></span>${message || "Loading…"}`;
+  logoutButton.classList.add("hidden");
+}
+
+function cap(text) {
+  return text ? text.charAt(0).toUpperCase() + text.slice(1) : text;
+}
+
+function showError(error) {
+  status.className = "status error";
+  statusText.textContent = cap(error.message);
+}
+
+function showAliasError(error) {
+  aliasError.textContent = cap(error.message);
+  aliasError.classList.remove("hidden");
+}
+
+function clearAliasError() {
+  aliasError.textContent = "";
+  aliasError.classList.add("hidden");
+}
+
+function setLoggedOut() {
+  aliasesSection.classList.add("hidden");
+  linksSection.classList.add("hidden");
+  logoutButton.classList.add("hidden");
+  status.className = "status";
+  statusText.innerHTML = `Logged out. E-mail <a href="mailto:hi@cc.me">hi@cc.me</a> to log in.`;
+}
+
+function setSignedIn() {
+  aliasesSection.classList.remove("hidden");
+  linksSection.classList.remove("hidden");
+  logoutButton.classList.remove("hidden");
+}
+
+logoutButton.onclick = () => {
+  try { localStorage.removeItem(STORAGE_KEY); } catch (error) {}
+  key = null;
+  setLoggedOut();
+};
+
+async function setAliasExpiry(alias, expiresAtUnix) {
+  try {
+    // No reload on success: re-rendering the list would steal focus from the
+    // control mid-edit. The control already reflects the new value.
+    await api(`/email/aliases/${encodeURIComponent(alias)}`, { expires_at_unix: expiresAtUnix }, "PATCH");
+    clearAliasError();
+  } catch (error) {
+    showAliasError(error);
+  }
+}
+
+function toLocalInput(unix) {
+  const d = new Date(unix * 1000);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function expiryControl(item) {
+  const label = document.createElement("label");
+  label.className = "expiry";
+  const cb = document.createElement("input");
+  cb.type = "checkbox";
+  cb.checked = Boolean(item.expires_at_unix);
+  const when = document.createElement("input");
+  when.type = "datetime-local";
+  when.disabled = !cb.checked;
+  when.value = toLocalInput(item.expires_at_unix || Math.floor(Date.now() / 1000) + 30 * 86400);
+  const unix = () => Math.floor(new Date(when.value).getTime() / 1000);
+  cb.onchange = () => {
+    when.disabled = !cb.checked;
+    setAliasExpiry(item.alias, cb.checked && when.value ? unix() : null);
+  };
+  when.onchange = () => { if (cb.checked && when.value) setAliasExpiry(item.alias, unix()); };
+  label.append(cb, document.createTextNode(" Expire at "), when);
+  return label;
+}
+
+function render(data) {
+  setSignedIn();
+  status.className = "status";
+  statusText.textContent = `Signed in as ${data.email}`;
+  clearAliasError();
+  aliases.textContent = "";
+  if (!data.aliases.length) {
+    aliases.innerHTML = `<li class="empty">No aliases yet.</li>`;
+  }
+  for (const item of data.aliases) {
+    const li = document.createElement("li");
+    const wrap = document.createElement("span");
+    const address = document.createElement("code");
+    address.textContent = item.address;
+    const meta = document.createElement("span");
+    meta.className = "meta";
+    meta.textContent = item.last_received_at_unix
+      ? `Last received ${new Date(item.last_received_at_unix * 1000).toLocaleString()}`
+      : "Never received yet";
+    wrap.append(address, meta);
+    const actions = document.createElement("span");
+    actions.className = "actions";
+    actions.append(expiryControl(item));
+    const button = document.createElement("button");
+    button.textContent = "Delete";
+    button.onclick = async () => {
+      try {
+        await api(`/email/aliases/${encodeURIComponent(item.alias)}`, {}, "DELETE");
+        await load();
+      } catch (error) {
+        showAliasError(error);
+      }
+    };
+    actions.append(button);
+    li.append(wrap, actions);
+    aliases.append(li);
+  }
+  links.textContent = "";
+  if (!data.magic_links.length) {
+    links.innerHTML = `<li class="empty">No magic links.</li>`;
+  }
+  for (const item of data.magic_links) {
+    const li = document.createElement("li");
+    const wrap = document.createElement("span");
+    const label = document.createElement("strong");
+    label.textContent = item.current ? "Current link" : "Magic link";
+    const meta = document.createElement("span");
+    meta.className = "meta";
+    const used = item.last_used_at_unix ? new Date(item.last_used_at_unix * 1000).toLocaleString() : "never";
+    const expires = new Date(item.expires_at_unix * 1000).toLocaleString();
+    meta.textContent = `Last used ${used} · expires ${expires}`;
+    wrap.append(label, meta);
+    const button = document.createElement("button");
+    button.textContent = "Invalidate";
+    button.onclick = async () => {
+      try {
+        await api(`/email/magic-links/${encodeURIComponent(item.id)}`, {}, "DELETE");
+        await load();
+      } catch (error) {
+        showAliasError(error);
+      }
+    };
+    li.append(wrap, button);
+    links.append(li);
+  }
+}
+
+async function load(initial = false) {
+  if (!key) {
+    setLoggedOut();
+    return;
+  }
+  if (initial) setLoading();
+  try {
+    render(await api("/email/session", {}));
+  } catch (error) {
+    if (error.status === 401) {
+      try { localStorage.removeItem(STORAGE_KEY); } catch (e) {}
+      key = null;
+    }
+    setLoggedOut();
+  }
+}
+
+form.onsubmit = async (event) => {
+  event.preventDefault();
+  const alias = input.value.trim();
+  if (!alias) return;
+  try {
+    await api("/email/aliases", { alias });
+    input.value = "";
+    createButton.disabled = true;
+    await load();
+  } catch (error) {
+    showAliasError(error);
+  }
+};
+
+function randomAlias() {
+  const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
+  const bytes = new Uint8Array(12);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (b) => chars[b % chars.length]).join("");
+}
+
+randomButton.onclick = async () => {
+  try {
+    await api("/email/aliases", { alias: randomAlias() });
+    await load();
+  } catch (error) {
+    showAliasError(error);
+  }
+};
+
+load(true).catch(showError);
+</script>
+</html>"#;
 const CLAIM_RECOVERY_SECONDS: u64 = 10 * 60;
 const INBOX_NOTIFY_CHANNEL: &str = "cc_i";
 const INBOX_NOTIFY_CAPACITY: usize = 4096;
@@ -127,6 +466,60 @@ struct AliasRequest {
 #[derive(Serialize)]
 struct AliasResponse {
     url: String,
+}
+
+#[derive(Deserialize)]
+struct EmailSessionRequest {
+    key: String,
+}
+
+#[derive(Serialize)]
+struct EmailSessionResponse {
+    email: String,
+    aliases: Vec<EmailAliasResponse>,
+    magic_links: Vec<EmailMagicLinkResponse>,
+}
+
+#[derive(Deserialize)]
+struct EmailAliasCreateRequest {
+    key: String,
+    alias: String,
+    #[serde(default)]
+    expiry_days: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct EmailAliasDeleteRequest {
+    key: String,
+}
+
+#[derive(Deserialize)]
+struct EmailAliasUpdateRequest {
+    key: String,
+    #[serde(default)]
+    expires_at_unix: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct EmailMagicLinkDeleteRequest {
+    key: String,
+}
+
+#[derive(Serialize)]
+struct EmailAliasResponse {
+    alias: String,
+    address: String,
+    last_received_at_unix: Option<i64>,
+    expires_at_unix: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct EmailMagicLinkResponse {
+    id: String,
+    created_at_unix: i64,
+    last_used_at_unix: Option<i64>,
+    expires_at_unix: i64,
+    current: bool,
 }
 
 #[derive(Serialize)]
@@ -207,6 +600,8 @@ struct StatsBucket {
     redirects: usize,
     inboxes: usize,
     inboxed_messages: usize,
+    aliases: usize,
+    forwarded: usize,
 }
 
 #[derive(Serialize)]
@@ -214,6 +609,8 @@ struct StatCounts {
     redirects: usize,
     inboxes: usize,
     inboxed_messages: usize,
+    aliases: usize,
+    forwarded: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -266,6 +663,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = Router::new()
         .route("/", get(root))
+        .route("/http", get(http_docs))
+        .route("/styles.css", get(docs_styles))
+        .route("/hi", get(email_page))
+        .route("/email/session", post(email_session))
+        .route("/email/aliases", post(create_email_alias))
+        .route(
+            "/email/aliases/{alias}",
+            delete(delete_email_alias).patch(update_email_alias),
+        )
+        .route("/email/magic-links/{id}", delete(delete_email_magic_link))
         .route("/c", post(create_alias))
         .route("/c/{alias}", get(alias_redirect))
         .route("/stats", get(stats))
@@ -363,6 +770,100 @@ async fn migrate(db: &PgPool) -> Result<(), sqlx::Error> {
     .await?;
 
     sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS aliases_target_idx ON aliases (target)")
+        .execute(db)
+        .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS email_login_keys (
+            id text UNIQUE,
+            token_hash bytea PRIMARY KEY,
+            email text NOT NULL,
+            created_at timestamptz NOT NULL DEFAULT now(),
+            last_used_at timestamptz,
+            expires_at timestamptz NOT NULL DEFAULT now() + interval '7 days',
+            revoked_at timestamptz
+        )
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query("ALTER TABLE email_login_keys ADD COLUMN IF NOT EXISTS id text")
+        .execute(db)
+        .await?;
+
+    sqlx::query("ALTER TABLE email_login_keys ADD COLUMN IF NOT EXISTS expires_at timestamptz")
+        .execute(db)
+        .await?;
+
+    sqlx::query("ALTER TABLE email_login_keys ADD COLUMN IF NOT EXISTS revoked_at timestamptz")
+        .execute(db)
+        .await?;
+
+    sqlx::query(
+        r#"
+        UPDATE email_login_keys
+        SET id = encode(substring(token_hash from 1 for 10), 'hex')
+        WHERE id IS NULL
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        UPDATE email_login_keys
+        SET expires_at = created_at + interval '30 days'
+        WHERE expires_at IS NULL
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query("ALTER TABLE email_login_keys ALTER COLUMN id SET NOT NULL")
+        .execute(db)
+        .await?;
+
+    sqlx::query("ALTER TABLE email_login_keys ALTER COLUMN expires_at SET NOT NULL")
+        .execute(db)
+        .await?;
+
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS email_login_keys_id_idx ON email_login_keys (id)",
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS email_login_keys_email_idx ON email_login_keys (email, created_at DESC)",
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS email_aliases (
+            alias text PRIMARY KEY,
+            email text NOT NULL,
+            created_at timestamptz NOT NULL DEFAULT now()
+        )
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS email_aliases_email_idx ON email_aliases (email, alias)",
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query("ALTER TABLE email_aliases ADD COLUMN IF NOT EXISTS last_received_at timestamptz")
+        .execute(db)
+        .await?;
+
+    sqlx::query("ALTER TABLE email_aliases ADD COLUMN IF NOT EXISTS expires_at timestamptz")
         .execute(db)
         .await?;
 
@@ -510,16 +1011,47 @@ async fn migrate(db: &PgPool) -> Result<(), sqlx::Error> {
 
 async fn root(State(state): State<AppState>, RawQuery(raw_query): RawQuery) -> AppResult<Response> {
     let Some(query) = raw_query.as_deref() else {
-        return redirect(DOCS_REDIRECT);
+        return Ok(docs_html_response());
     };
 
     let Some(target) = callback_target(query)? else {
-        return redirect(DOCS_REDIRECT);
+        return Ok(docs_html_response());
     };
 
     let response = redirect(target.as_str())?;
     record_stat_soon(&state, StatKind::Redirect, None);
     Ok(response)
+}
+
+async fn docs_styles() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/css; charset=utf-8"),
+            (header::CACHE_CONTROL, "public, max-age=300"),
+        ],
+        DOCS_STYLES_CSS,
+    )
+}
+
+async fn http_docs() -> Response {
+    docs_html(DOCS_HTTP_HTML)
+}
+
+fn docs_html_response() -> Response {
+    docs_html(DOCS_INDEX_HTML)
+}
+
+fn docs_html(body: &'static str) -> Response {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CONTENT_SECURITY_POLICY, DOCS_CSP),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 async fn create_alias(
@@ -535,6 +1067,180 @@ async fn create_alias(
             url: format!("{PUBLIC_BASE_URL}/c/{alias}"),
         }),
     ))
+}
+
+async fn email_page() -> Html<&'static str> {
+    Html(EMAIL_PAGE_HTML)
+}
+
+async fn email_session(
+    State(state): State<AppState>,
+    Json(body): Json<EmailSessionRequest>,
+) -> AppResult<Json<EmailSessionResponse>> {
+    let email = email_for_key(&state, &body.key).await?;
+    let aliases = load_email_aliases(&state, &email).await?;
+    let magic_links = load_email_magic_links(&state, &email, &body.key).await?;
+    Ok(Json(EmailSessionResponse {
+        email,
+        aliases,
+        magic_links,
+    }))
+}
+
+async fn create_email_alias(
+    State(state): State<AppState>,
+    Json(body): Json<EmailAliasCreateRequest>,
+) -> AppResult<(StatusCode, Json<EmailAliasResponse>)> {
+    let email = email_for_key(&state, &body.key).await?;
+    let alias = normalize_email_alias(&body.alias)?;
+    let expiry_days = match body.expiry_days {
+        Some(days) if !(1..=3650).contains(&days) => {
+            return Err(AppError::new(
+                StatusCode::BAD_REQUEST,
+                "expiry must be between 1 and 3650 days",
+            ));
+        }
+        other => other.map(|days| days as i32),
+    };
+
+    let expires_at_unix = sqlx::query_scalar::<_, Option<i64>>(
+        r#"
+        INSERT INTO email_aliases (alias, email, expires_at)
+        VALUES (
+            $1, $2,
+            CASE WHEN $3::int IS NULL THEN NULL ELSE now() + ($3::int * interval '1 day') END
+        )
+        RETURNING extract(epoch from expires_at)::bigint
+        "#,
+    )
+    .bind(&alias)
+    .bind(&email)
+    .bind(expiry_days)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|err| match err {
+        sqlx::Error::Database(db_err) if db_err.is_unique_violation() => {
+            AppError::new(StatusCode::CONFLICT, "alias is already taken")
+        }
+        err => db_error(err),
+    })?;
+
+    record_stat_soon(&state, StatKind::Alias, None);
+
+    Ok((
+        StatusCode::CREATED,
+        Json(EmailAliasResponse {
+            address: email_alias_address(&alias),
+            alias,
+            last_received_at_unix: None,
+            expires_at_unix,
+        }),
+    ))
+}
+
+async fn delete_email_alias(
+    State(state): State<AppState>,
+    Path(alias): Path<String>,
+    Json(body): Json<EmailAliasDeleteRequest>,
+) -> AppResult<Json<EmailAliasResponse>> {
+    let email = email_for_key(&state, &body.key).await?;
+    let alias = normalize_email_alias(&alias)?;
+    let Some(row) = sqlx::query(
+        r#"
+        DELETE FROM email_aliases
+        WHERE alias = $1 AND email = $2
+        RETURNING alias
+        "#,
+    )
+    .bind(&alias)
+    .bind(&email)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(db_error)?
+    else {
+        return Err(AppError::new(StatusCode::NOT_FOUND, "alias not found"));
+    };
+    let alias = row.get::<String, _>("alias");
+
+    Ok(Json(EmailAliasResponse {
+        address: email_alias_address(&alias),
+        alias,
+        last_received_at_unix: None,
+        expires_at_unix: None,
+    }))
+}
+
+async fn update_email_alias(
+    State(state): State<AppState>,
+    Path(alias): Path<String>,
+    Json(body): Json<EmailAliasUpdateRequest>,
+) -> AppResult<Json<EmailAliasResponse>> {
+    let email = email_for_key(&state, &body.key).await?;
+    let alias = normalize_email_alias(&alias)?;
+    let expires_at_unix = match body.expires_at_unix {
+        Some(ts) if !(0..=4_102_444_800).contains(&ts) => {
+            return Err(AppError::new(StatusCode::BAD_REQUEST, "invalid expiry"));
+        }
+        other => other,
+    };
+
+    let Some(row) = sqlx::query(
+        r#"
+        UPDATE email_aliases
+        SET expires_at = CASE WHEN $3::bigint IS NULL THEN NULL ELSE to_timestamp($3::bigint) END
+        WHERE alias = $1 AND email = $2
+        RETURNING extract(epoch from last_received_at)::bigint AS last_received_at_unix,
+                  extract(epoch from expires_at)::bigint AS expires_at_unix
+        "#,
+    )
+    .bind(&alias)
+    .bind(&email)
+    .bind(expires_at_unix)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(db_error)?
+    else {
+        return Err(AppError::new(StatusCode::NOT_FOUND, "alias not found"));
+    };
+
+    Ok(Json(EmailAliasResponse {
+        address: email_alias_address(&alias),
+        alias,
+        last_received_at_unix: row.get::<Option<i64>, _>("last_received_at_unix"),
+        expires_at_unix: row.get::<Option<i64>, _>("expires_at_unix"),
+    }))
+}
+
+async fn delete_email_magic_link(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<EmailMagicLinkDeleteRequest>,
+) -> AppResult<Json<EmailMagicLinkResponse>> {
+    let email = email_for_key(&state, &body.key).await?;
+    let current_hash = email_key_hash(&body.key)?;
+    let Some(row) = sqlx::query(
+        r#"
+        UPDATE email_login_keys
+        SET revoked_at = COALESCE(revoked_at, now())
+        WHERE id = $1 AND email = $2
+        RETURNING id,
+                  extract(epoch from created_at)::bigint AS created_at_unix,
+                  extract(epoch from last_used_at)::bigint AS last_used_at_unix,
+                  extract(epoch from expires_at)::bigint AS expires_at_unix,
+                  token_hash = $3 AS current
+        "#,
+    )
+    .bind(&id)
+    .bind(&email)
+    .bind(&current_hash)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(db_error)?
+    else {
+        return Err(AppError::new(StatusCode::NOT_FOUND, "magic link not found"));
+    };
+
+    Ok(Json(email_magic_link_from_row(row)))
 }
 
 async fn insert_alias(state: &AppState, target: &str) -> AppResult<String> {
@@ -873,14 +1579,23 @@ fn verify_inbox_request(
     let timestamp = header_string(headers, AUTH_TIMESTAMP_HEADER)
         .ok_or_else(|| AppError::new(StatusCode::UNAUTHORIZED, "timestamp is required"))?
         .parse::<u64>()
-        .map_err(|_| AppError::new(StatusCode::UNAUTHORIZED, "timestamp must be a positive integer"))?;
+        .map_err(|_| {
+            AppError::new(
+                StatusCode::UNAUTHORIZED,
+                "timestamp must be a positive integer",
+            )
+        })?;
 
     let signature = header_string(headers, AUTH_SIGNATURE_HEADER)
         .ok_or_else(|| AppError::new(StatusCode::UNAUTHORIZED, "signature is required"))?;
 
     let now = current_unix_seconds()?;
-    if timestamp.saturating_add(AUTH_WINDOW_SECONDS) < now || timestamp > now + AUTH_WINDOW_SECONDS {
-        return Err(AppError::new(StatusCode::UNAUTHORIZED, "timestamp is outside acceptable window"));
+    if timestamp.saturating_add(AUTH_WINDOW_SECONDS) < now || timestamp > now + AUTH_WINDOW_SECONDS
+    {
+        return Err(AppError::new(
+            StatusCode::UNAUTHORIZED,
+            "timestamp is outside acceptable window",
+        ));
     }
 
     let signature_bytes = URL_SAFE_NO_PAD
@@ -1295,6 +2010,9 @@ async fn load_stats(state: &AppState) -> AppResult<StatsResponse> {
             &hour_buckets,
         )
         .await?,
+        aliases: count_total(&state.db, StatKind::Alias, StatPeriod::Hour, &hour_buckets).await?,
+        forwarded: count_total(&state.db, StatKind::Forward, StatPeriod::Hour, &hour_buckets)
+            .await?,
     };
     let last_30_days = StatCounts {
         redirects: count_total(&state.db, StatKind::Redirect, StatPeriod::Day, &day_buckets)
@@ -1302,6 +2020,8 @@ async fn load_stats(state: &AppState) -> AppResult<StatsResponse> {
         inboxes: count_total(&state.db, StatKind::Inbox, StatPeriod::Day, &day_buckets).await?,
         inboxed_messages: count_total(&state.db, StatKind::Message, StatPeriod::Day, &day_buckets)
             .await?,
+        aliases: count_total(&state.db, StatKind::Alias, StatPeriod::Day, &day_buckets).await?,
+        forwarded: count_total(&state.db, StatKind::Forward, StatPeriod::Day, &day_buckets).await?,
     };
 
     let hourly = stat_buckets(&state.db, hour_buckets, 3600, StatPeriod::Hour).await?;
@@ -1325,6 +2045,8 @@ async fn stat_buckets(
     let redirects = count_series(db, StatKind::Redirect, period, &buckets).await?;
     let inboxes = count_series(db, StatKind::Inbox, period, &buckets).await?;
     let messages = count_series(db, StatKind::Message, period, &buckets).await?;
+    let aliases = count_series(db, StatKind::Alias, period, &buckets).await?;
+    let forwarded = count_series(db, StatKind::Forward, period, &buckets).await?;
 
     Ok(buckets
         .into_iter()
@@ -1333,6 +2055,8 @@ async fn stat_buckets(
             redirects: *redirects.get(&bucket).unwrap_or(&0),
             inboxes: *inboxes.get(&bucket).unwrap_or(&0),
             inboxed_messages: *messages.get(&bucket).unwrap_or(&0),
+            aliases: *aliases.get(&bucket).unwrap_or(&0),
+            forwarded: *forwarded.get(&bucket).unwrap_or(&0),
         })
         .collect())
 }
@@ -1507,7 +2231,12 @@ async fn record_stat_batch(db: &PgPool, batch: &[StatEvent]) -> AppResult<()> {
     let mut tx = db.begin().await.map_err(db_error)?;
 
     for (period, bucket) in periods {
-        for kind in [StatKind::Redirect, StatKind::Message] {
+        for kind in [
+            StatKind::Redirect,
+            StatKind::Message,
+            StatKind::Alias,
+            StatKind::Forward,
+        ] {
             let count = batch.iter().filter(|event| event.kind == kind).count();
             if count > 0 {
                 insert_stat_count(&mut tx, period, kind, bucket, count).await?;
@@ -2094,6 +2823,159 @@ fn parse_callback_target(target: &str) -> AppResult<Url> {
     Ok(url)
 }
 
+async fn email_for_key(state: &AppState, key: &str) -> AppResult<String> {
+    let token_hash = email_key_hash(key)?;
+    let Some(row) = sqlx::query(
+        r#"
+        UPDATE email_login_keys
+        SET last_used_at = now()
+        WHERE token_hash = $1
+          AND revoked_at IS NULL
+          AND expires_at > now()
+        RETURNING email
+        "#,
+    )
+    .bind(token_hash)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(db_error)?
+    else {
+        return Err(AppError::new(
+            StatusCode::UNAUTHORIZED,
+            "email key is invalid",
+        ));
+    };
+
+    Ok(row.get::<String, _>("email"))
+}
+
+async fn load_email_magic_links(
+    state: &AppState,
+    email: &str,
+    current_key: &str,
+) -> AppResult<Vec<EmailMagicLinkResponse>> {
+    let current_hash = email_key_hash(current_key)?;
+    let rows = sqlx::query(
+        r#"
+        SELECT id,
+               extract(epoch from created_at)::bigint AS created_at_unix,
+               extract(epoch from last_used_at)::bigint AS last_used_at_unix,
+               extract(epoch from expires_at)::bigint AS expires_at_unix,
+               token_hash = $2 AS current
+        FROM email_login_keys
+        WHERE email = $1
+          AND revoked_at IS NULL
+        ORDER BY created_at DESC
+        "#,
+    )
+    .bind(email)
+    .bind(current_hash)
+    .fetch_all(&state.db)
+    .await
+    .map_err(db_error)?;
+
+    Ok(rows.into_iter().map(email_magic_link_from_row).collect())
+}
+
+fn email_magic_link_from_row(row: sqlx::postgres::PgRow) -> EmailMagicLinkResponse {
+    EmailMagicLinkResponse {
+        id: row.get::<String, _>("id"),
+        created_at_unix: row.get::<i64, _>("created_at_unix"),
+        last_used_at_unix: row.get::<Option<i64>, _>("last_used_at_unix"),
+        expires_at_unix: row.get::<i64, _>("expires_at_unix"),
+        current: row.get::<bool, _>("current"),
+    }
+}
+
+async fn load_email_aliases(state: &AppState, email: &str) -> AppResult<Vec<EmailAliasResponse>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT alias,
+               extract(epoch from last_received_at)::bigint AS last_received_at_unix,
+               extract(epoch from expires_at)::bigint AS expires_at_unix
+        FROM email_aliases
+        WHERE email = $1
+        ORDER BY alias
+        "#,
+    )
+    .bind(email)
+    .fetch_all(&state.db)
+    .await
+    .map_err(db_error)?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let alias = row.get::<String, _>("alias");
+            EmailAliasResponse {
+                address: email_alias_address(&alias),
+                alias,
+                last_received_at_unix: row.get::<Option<i64>, _>("last_received_at_unix"),
+                expires_at_unix: row.get::<Option<i64>, _>("expires_at_unix"),
+            }
+        })
+        .collect())
+}
+
+fn email_key_hash(key: &str) -> AppResult<Vec<u8>> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(key)
+        .map_err(|_| AppError::new(StatusCode::BAD_REQUEST, "email key must be base64url"))?;
+    if bytes.len() != EMAIL_KEY_BYTES {
+        return Err(AppError::new(
+            StatusCode::BAD_REQUEST,
+            "email key must be 32 bytes",
+        ));
+    }
+    Ok(Sha256::digest(&bytes).to_vec())
+}
+
+fn normalize_email_alias(alias: &str) -> AppResult<String> {
+    let mut alias = alias.trim().to_ascii_lowercase();
+    if let Some(local) = alias.strip_suffix(&format!("@{EMAIL_ALIAS_DOMAIN}")) {
+        alias = local.to_owned();
+    }
+    if alias.is_empty()
+        || alias.len() < 4
+        || alias.len() > 64
+        || alias.starts_with('.')
+        || alias.ends_with('.')
+        || alias.contains("..")
+        || !alias.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'.' | b'_' | b'-' | b'+')
+        })
+    {
+        return Err(AppError::new(StatusCode::BAD_REQUEST, "invalid alias"));
+    }
+    if is_reserved_email_alias(&alias) {
+        return Err(AppError::new(StatusCode::BAD_REQUEST, "alias is reserved"));
+    }
+    Ok(alias)
+}
+
+fn is_reserved_email_alias(alias: &str) -> bool {
+    matches!(
+        alias,
+        "abuse"
+            | "admin"
+            | "administrator"
+            | "hi"
+            | "hostmaster"
+            | "mailer-daemon"
+            | "postmaster"
+            | "root"
+            | "security"
+            | "webmaster"
+            | "echo"
+    )
+}
+
+fn email_alias_address(alias: &str) -> String {
+    format!("{alias}@{EMAIL_ALIAS_DOMAIN}")
+}
+
 fn decode_public_keys(encoded: &str) -> AppResult<Vec<(String, VerifyingKey)>> {
     let parts = encoded.split('.').collect::<Vec<_>>();
     if parts.is_empty() || parts.len() > MAX_INBOX_RECIPIENTS {
@@ -2119,9 +3001,9 @@ fn decode_public_key(encoded: &str) -> AppResult<VerifyingKey> {
     let bytes = URL_SAFE_NO_PAD
         .decode(encoded)
         .map_err(|_| AppError::new(StatusCode::BAD_REQUEST, "public key must be base64url"))?;
-    let bytes: [u8; 32] = bytes.try_into().map_err(|_| {
-        AppError::new(StatusCode::BAD_REQUEST, "public key must be 32 bytes")
-    })?;
+    let bytes: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| AppError::new(StatusCode::BAD_REQUEST, "public key must be 32 bytes"))?;
     VerifyingKey::from_bytes(&bytes)
         .map_err(|_| AppError::new(StatusCode::BAD_REQUEST, "public key is invalid"))
 }
@@ -2130,8 +3012,12 @@ fn derive_x25519_public_key(verifying_key: &VerifyingKey) -> AppResult<PublicKey
     let edwards_point = CompressedEdwardsY(verifying_key.to_bytes())
         .decompress()
         .ok_or_else(|| AppError::new(StatusCode::BAD_REQUEST, "public key is invalid"))?;
-    PublicKey::from_slice(edwards_point.to_montgomery().as_bytes())
-        .map_err(|_| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "encryption key derivation failed"))
+    PublicKey::from_slice(edwards_point.to_montgomery().as_bytes()).map_err(|_| {
+        AppError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "encryption key derivation failed",
+        )
+    })
 }
 
 fn public_key_key(public_key: &VerifyingKey) -> String {
@@ -2263,6 +3149,8 @@ enum StatKind {
     Redirect,
     Inbox,
     Message,
+    Alias,
+    Forward,
 }
 
 impl StatKind {
@@ -2271,6 +3159,8 @@ impl StatKind {
             Self::Redirect => "r",
             Self::Inbox => "i",
             Self::Message => "m",
+            Self::Alias => "a",
+            Self::Forward => "f",
         }
     }
 }
@@ -2469,6 +3359,32 @@ mod tests {
         assert!(!query_wants_go_import(""));
     }
 
+    #[test]
+    fn email_alias_normalization_accepts_cc_me_local_parts() {
+        assert_eq!(normalize_email_alias("Example").unwrap(), "example");
+        assert_eq!(
+            normalize_email_alias("Example+tag@CC.ME").unwrap(),
+            "example+tag"
+        );
+        assert_eq!(email_alias_address("example"), "example@cc.me");
+    }
+
+    #[test]
+    fn email_alias_normalization_rejects_invalid_names() {
+        for alias in [
+            "abc",
+            ".abcd",
+            "abcd.",
+            "ab..cd",
+            "ab cd",
+            "ab/cd",
+            "hi",
+            "postmaster",
+        ] {
+            assert!(normalize_email_alias(alias).is_err(), "{alias}");
+        }
+    }
+
     fn go_import_router() -> Router {
         Router::new()
             .route("/", get(|| async { "root" }))
@@ -2494,7 +3410,9 @@ mod tests {
             .unwrap();
         let (status, body) = body_text(response).await;
         assert_eq!(status, StatusCode::OK);
-        assert!(body.contains(r#"<meta name="go-import" content="cc.me git https://github.com/xmit-co/cc.me">"#));
+        assert!(body.contains(
+            r#"<meta name="go-import" content="cc.me git https://github.com/xmit-co/cc.me">"#
+        ));
     }
 
     #[tokio::test]
@@ -2822,7 +3740,9 @@ mod tests {
         let x25519_public_key = derive_x25519_public_key(&verifying_key).unwrap();
 
         let plaintext = b"hello world";
-        let ciphertext = x25519_public_key.seal(&mut OsRng.unwrap_err(), plaintext).unwrap();
+        let ciphertext = x25519_public_key
+            .seal(&mut OsRng.unwrap_err(), plaintext)
+            .unwrap();
 
         let x25519_secret_key = derive_x25519_secret_key(&signing_key);
         let decrypted = x25519_secret_key.unseal(&ciphertext).unwrap();
@@ -2863,8 +3783,8 @@ mod tests {
             current_unix_seconds().unwrap().to_string().parse().unwrap(),
         );
 
-        let err = verify_inbox_request(&verifying_key, &Method::POST, &uri, &headers, &body)
-            .unwrap_err();
+        let err =
+            verify_inbox_request(&verifying_key, &Method::POST, &uri, &headers, &body).unwrap_err();
         assert_eq!(err.status, StatusCode::UNAUTHORIZED);
     }
 
@@ -2887,8 +3807,8 @@ mod tests {
                 .unwrap(),
         );
 
-        let err = verify_inbox_request(&verifying_key, &Method::POST, &uri, &headers, &body)
-            .unwrap_err();
+        let err =
+            verify_inbox_request(&verifying_key, &Method::POST, &uri, &headers, &body).unwrap_err();
         assert_eq!(err.status, StatusCode::UNAUTHORIZED);
     }
 
