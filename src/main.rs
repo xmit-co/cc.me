@@ -2641,6 +2641,7 @@ fn is_reserved_email_alias(alias: &str) -> bool {
             | "security"
             | "webmaster"
             | "echo"
+            | "todo"
     )
 }
 
