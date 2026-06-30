@@ -1493,7 +1493,7 @@ async fn paste_view_page(State(_state): State<AppState>, Path(_id): Path<String>
 
 fn secret_page_response(html: &str, nonce: &str) -> Response {
     let csp = format!(
-        "default-src 'none'; script-src 'nonce-{0}' 'self'; style-src 'nonce-{0}'; connect-src 'self'; base-uri 'none'",
+        "default-src 'none'; script-src 'nonce-{0}' 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'",
         nonce
     );
     let mut headers = HeaderMap::new();
