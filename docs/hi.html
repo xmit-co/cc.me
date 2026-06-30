@@ -1,99 +1,56 @@
 <!doctype html>
 <html lang="en">
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>cc.me email aliases</title>
-<style>
-  :root {
-    color-scheme: light dark;
-    --b: #fff;
-    --f: #181a1f;
-    --m: #5d6470;
-    --l: #d8dde5;
-    --c: #f5f7fa;
-    --a: #155eef;
-    --bad: #b42318;
-    font-family: system-ui, sans-serif;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --b: #101114;
-      --f: #eceff3;
-      --m: #a9b0bb;
-      --l: #30343b;
-      --c: #1c1f25;
-      --a: #8ab4ff;
-      --bad: #fda29b;
-    }
-  }
-  * { box-sizing: border-box; }
-  body { margin: 0; background: var(--b); color: var(--f); }
-  header, main { max-width: 58em; margin-inline: auto; padding-inline: 1rem; }
-  header { display: flex; justify-content: space-between; align-items: center; gap: 1.5rem; padding-block: 1.125rem; border-bottom: 1px solid var(--l); }
-  .brand { font-weight: 700; color: var(--f); text-decoration: none; }
-  h2 { margin: 0; font-size: 1.15rem; }
-  p { margin: 0; color: var(--m); line-height: 1.55; }
-  a { color: var(--a); }
-  main { display: grid; gap: 2rem; padding-block: 2.75rem 4.5rem; }
-  section { display: grid; gap: 1rem; align-content: start; }
-  input, button { font: inherit; }
-  form { display: flex; align-items: stretch; gap: .5rem; }
-  .field { display: flex; flex: 1; min-width: 0; border: 1px solid var(--l); border-radius: .375rem; overflow: hidden; background: var(--b); }
-  input { flex: 1; min-width: 0; border: 0; padding: .625rem .75rem; background: transparent; color: var(--f); }
-  .expiry { display: flex; align-items: center; gap: .4rem; color: var(--m); white-space: nowrap; font-size: .875rem; }
-  .expiry input:not([type=checkbox]) { flex: 0 0 auto; width: auto; border: 1px solid var(--l); border-radius: .375rem; background: var(--b); color: var(--f); padding: .35rem .4rem; }
-  .expiry input[type=checkbox] { flex: 0 0 auto; width: auto; padding: 0; margin: 0; }
-  .actions { display: flex; align-items: center; gap: .75rem; }
-  #logout { flex: 0 0 auto; width: auto; }
-  .suffix { display: flex; align-items: center; padding: 0 .75rem; border-left: 1px solid var(--l); color: var(--m); background: var(--c); }
-  button { padding: .625rem .875rem; border: 1px solid var(--l); border-radius: .375rem; background: var(--c); color: var(--f); cursor: pointer; }
-  button:hover:not(:disabled) { border-color: var(--a); }
-  button:disabled, input:disabled { cursor: not-allowed; opacity: .55; }
-  ul { margin: 0; padding: 0; list-style: none; display: grid; gap: 1rem; }
-  li { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
-  code { background: var(--c); padding: .125rem .375rem; border-radius: .25rem; font-family: ui-monospace, monospace; }
-  .meta { display: block; margin-top: .25rem; color: var(--m); font-size: .875rem; }
-  .empty { color: var(--m); }
-  .status { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: .75rem .875rem; border: 1px solid var(--l); border-radius: .375rem; background: var(--c); }
-  .error { color: var(--bad); }
-  .hidden { display: none; }
-  .spinner { display: inline-block; width: 1em; height: 1em; margin-right: .5em; vertical-align: -.15em; border: 2px solid var(--l); border-top-color: var(--a); border-radius: 50%; animation: spin .7s linear infinite; }
-  @keyframes spin { to { transform: rotate(360deg); } }
-  @media (max-width: 36rem) {
-    form, li { display: block; }
-    button { margin-top: .5rem; width: 100%; }
-  }
-</style>
-<header>
-  <span class="brand"><a href="/">cc.me</a> / E-mail</span>
-</header>
-<main>
-  <noscript><p class="status error">JavaScript is required to manage your cc.me aliases.</p></noscript>
-  <div id="status" class="status">
-    <span id="status-text"><span class="spinner"></span>Loading…</span>
-    <button type="button" id="logout" class="hidden">Log out</button>
-  </div>
-  <section id="aliases-section">
-    <h2>Aliases</h2>
-    <p>Create <code>@cc.me</code> email addresses that forward to your inbox.</p>
-    <form id="create">
-      <span class="field">
-        <input id="alias" autocomplete="off" autofocus placeholder="alias" minlength="4">
-        <span class="suffix">@cc.me</span>
-      </span>
-      <button disabled>Create</button>
-      <button type="button" id="random">Random</button>
-    </form>
-    <p id="alias-error" class="error hidden"></p>
-    <ul id="aliases"></ul>
-  </section>
-  <section id="links-section">
-    <h2>Magic links</h2>
-    <p>Invalidate old links you no longer use.</p>
-    <ul id="links"></ul>
-  </section>
-</main>
-<script>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>cc.me — email</title>
+    <meta name="description" content="Create @cc.me email addresses that forward to your inbox." />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="go-import" content="cc.me git https://github.com/xmit-co/cc.me" />
+    <meta
+      name="go-source"
+      content="cc.me https://github.com/xmit-co/cc.me https://github.com/xmit-co/cc.me/tree/main{/dir} https://github.com/xmit-co/cc.me/blob/main{/dir}/{file}#L{line}"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body class="app">
+    <header>
+      <span class="brand"><a href="/">cc.me</a> / email</span>
+    </header>
+    <main>
+      <section class="intro">
+        <h1>Email.</h1>
+        <p>
+          Create <code>@cc.me</code> email addresses that forward to your inbox. Have as many as you
+          want, set them to expire, and delete them whenever.
+        </p>
+      </section>
+      <noscript><p class="status error">JavaScript is required to manage your cc.me aliases.</p></noscript>
+      <div id="status" class="status">
+        <span id="status-text"><span class="spinner"></span>Loading…</span>
+        <button type="button" id="logout" class="hidden">Log out</button>
+      </div>
+      <section id="aliases-section" class="hidden">
+        <h2>Aliases</h2>
+        <p>Manage the addresses that forward to your inbox.</p>
+        <form id="create">
+          <span class="field">
+            <input id="alias" autocomplete="off" autofocus placeholder="alias" minlength="4" />
+            <span class="suffix">@cc.me</span>
+          </span>
+          <button disabled>Create</button>
+          <button type="button" id="random">Random</button>
+        </form>
+        <p id="alias-error" class="error hidden"></p>
+        <ul id="aliases"></ul>
+      </section>
+      <section id="links-section" class="hidden">
+        <h2>Magic links</h2>
+        <p>Invalidate old links you no longer use.</p>
+        <ul id="links"></ul>
+      </section>
+    </main>
+    <script>
 const STORAGE_KEY = "cc-me-code";
 let key = new URLSearchParams(location.hash.slice(1)).get("code");
 try {
@@ -163,7 +120,7 @@ function setLoggedOut() {
   linksSection.classList.add("hidden");
   logoutButton.classList.add("hidden");
   status.className = "status";
-  statusText.innerHTML = `<a href="mailto:hi@cc.me">Send an empty E-mail to hi@cc.me</a> &amp; we'll reply with a magic link.`;
+  statusText.innerHTML = `<a href="mailto:hi@cc.me">Send an empty email to hi@cc.me</a> &amp; we'll reply with a magic link.`;
 }
 
 function setSignedIn() {
@@ -332,5 +289,6 @@ randomButton.onclick = async () => {
 };
 
 load(true).catch(showError);
-</script>
+    </script>
+  </body>
 </html>

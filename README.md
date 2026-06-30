@@ -66,4 +66,4 @@ npx cc-me inspect
 ```
 
 By [xmit dev team](https://xmit.dev/). We respect privacy: HTTP deliveries are
-encrypted for your key and we don't inspect your E-mails.
+encrypted for your key and we don't inspect your emails.
