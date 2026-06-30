@@ -16,7 +16,7 @@ use axum::{
     http::{HeaderMap, Method, StatusCode, Uri, header},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use crypto_box::{
@@ -40,6 +40,7 @@ use tokio::{
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info};
 use url::{Url, form_urlencoded};
+use uuid::Uuid;
 
 const ACK_ID_LIMIT: usize = 1000;
 const ALIAS_ID_BYTES: usize = 10;
@@ -49,6 +50,7 @@ const AUTH_VERSION: &str = "cc-me-v1";
 const AUTH_WINDOW_SECONDS: u64 = 5 * 60;
 const DOCS_INDEX_HTML: &str = include_str!("../docs/index.html");
 const DOCS_HTTP_HTML: &str = include_str!("../docs/http.html");
+const DOCS_LIB_HTML: &str = include_str!("../docs/lib.html");
 const DOCS_STYLES_CSS: &str = include_str!("../docs/styles.css");
 const DOCS_CSP: &str = "frame-ancestors https://pcarrier.com";
 const EMAIL_ALIAS_DOMAIN: &str = "cc.me";
@@ -64,6 +66,8 @@ const EMAIL_PAGE_HTML: &str = include_str!("../docs/hi.html");
 const CLAIM_RECOVERY_SECONDS: u64 = 10 * 60;
 const INBOX_NOTIFY_CHANNEL: &str = "cc_i";
 const INBOX_NOTIFY_CAPACITY: usize = 4096;
+const LIBRARY_NOTIFY_CHANNEL: &str = "cc_l";
+const LIBRARY_NOTIFY_CAPACITY: usize = 4096;
 const MAX_CAPTURE_BYTES: usize = 64 * 1024;
 const MAX_INBOX_RECIPIENTS: usize = 16;
 const MAX_INBOX_RESPONSE_BYTES: usize = 1024 * 1024;
@@ -90,6 +94,7 @@ static EVENT_PREFIX: LazyLock<String> = LazyLock::new(|| {
 struct AppState {
     db: PgPool,
     inbox_tx: broadcast::Sender<String>,
+    library_tx: broadcast::Sender<String>,
     stats_tx: mpsc::Sender<StatEvent>,
     config: Config,
 }
@@ -102,6 +107,9 @@ struct Config {
     default_get_limit: usize,
     max_get_limit: usize,
     long_poll_seconds: f64,
+    library_max_count: i64,
+    library_max_ttl_seconds: f64,
+    library_max_wait_seconds: f64,
 }
 
 #[derive(Debug)]
@@ -252,6 +260,49 @@ struct ReleaseResponse {
     missing: Vec<String>,
 }
 
+#[derive(Deserialize)]
+struct PutResourceRequest {
+    count: i64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ResourceResponse {
+    id: String,
+    count: i64,
+    in_use: i64,
+    available: i64,
+}
+
+#[derive(Deserialize)]
+struct BorrowRequest {
+    ttl: f64,
+    #[serde(default)]
+    wait: f64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct BorrowResponse {
+    lease: String,
+    position: i64,
+    expires_at_unix: i64,
+    expires_in: i64,
+}
+
+#[derive(Deserialize)]
+struct ReturnRequest {
+    lease: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ReturnResponse {
+    returned: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct DeleteResponse {
+    deleted: bool,
+}
+
 #[derive(Serialize)]
 struct StatsResponse {
     now_unix: u64,
@@ -325,12 +376,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         inbox_tx.clone(),
     ));
 
+    let (library_tx, _) = broadcast::channel(LIBRARY_NOTIFY_CAPACITY);
+    tokio::spawn(library_notification_worker(
+        config.database_url.clone(),
+        library_tx.clone(),
+    ));
+
     let (stats_tx, stats_rx) = mpsc::channel(STATS_CHANNEL_CAPACITY);
     tokio::spawn(stats_worker(db.clone(), stats_rx));
 
     let app = Router::new()
         .route("/", get(root))
         .route("/http", get(http_docs))
+        .route("/lib", get(library_docs))
+        .route(
+            "/l/{id}",
+            put(put_resource).get(get_resource).delete(delete_resource),
+        )
+        .route("/l/{id}/borrow", post(borrow_resource))
+        .route("/l/{id}/return", post(return_lease))
         .route("/styles.css", get(docs_styles))
         .route("/hi", get(email_page))
         .route("/email/session", post(email_session))
@@ -371,6 +435,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_state(AppState {
             db,
             inbox_tx,
+            library_tx,
             stats_tx,
             config: config.clone(),
         });
@@ -673,6 +738,50 @@ async fn migrate(db: &PgPool) -> Result<(), sqlx::Error> {
     .execute(db)
     .await?;
 
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS library_resources (
+            id         uuid PRIMARY KEY,
+            count      bigint NOT NULL CHECK (count >= 0),
+            created_at timestamptz NOT NULL DEFAULT now()
+        )
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS library_leases (
+            id          uuid PRIMARY KEY,
+            resource_id uuid NOT NULL REFERENCES library_resources(id) ON DELETE CASCADE,
+            position    bigint NOT NULL CHECK (position >= 0),
+            acquired_at timestamptz NOT NULL DEFAULT now(),
+            expires_at  timestamptz NOT NULL
+        )
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE UNIQUE INDEX IF NOT EXISTS library_leases_slot_idx
+            ON library_leases (resource_id, position)
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS library_leases_expiry_idx
+            ON library_leases (resource_id, expires_at)
+        "#,
+    )
+    .execute(db)
+    .await?;
+
     Ok(())
 }
 
@@ -703,6 +812,317 @@ async fn docs_styles() -> impl IntoResponse {
 
 async fn http_docs() -> Response {
     docs_html(DOCS_HTTP_HTML)
+}
+
+async fn library_docs() -> Response {
+    docs_html(DOCS_LIB_HTML)
+}
+
+fn parse_uuid(id: &str) -> AppResult<Uuid> {
+    Uuid::parse_str(id).map_err(|_| AppError::new(StatusCode::BAD_REQUEST, "id must be a UUID"))
+}
+
+async fn put_resource(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<PutResourceRequest>,
+) -> AppResult<Json<ResourceResponse>> {
+    let id = parse_uuid(&id)?;
+    if body.count < 0 || body.count > state.config.library_max_count {
+        return Err(AppError::new(StatusCode::BAD_REQUEST, "count out of range"));
+    }
+
+    sqlx::query(
+        r#"
+        INSERT INTO library_resources (id, count)
+        VALUES ($1, $2)
+        ON CONFLICT (id) DO UPDATE SET count = EXCLUDED.count
+        "#,
+    )
+    .bind(id)
+    .bind(body.count)
+    .execute(&state.db)
+    .await
+    .map_err(db_error)?;
+
+    notify_library(&state, &id.to_string()).await;
+    resource_response(&state, id).await
+}
+
+async fn get_resource(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> AppResult<Json<ResourceResponse>> {
+    let id = parse_uuid(&id)?;
+    resource_response(&state, id).await
+}
+
+async fn resource_response(state: &AppState, id: Uuid) -> AppResult<Json<ResourceResponse>> {
+    let Some(row) = sqlx::query(
+        r#"
+        SELECT r.count,
+               (SELECT count(*) FROM library_leases l
+                WHERE l.resource_id = r.id
+                  AND l.expires_at > now()
+                  AND l.position < r.count) AS in_use
+        FROM library_resources r
+        WHERE r.id = $1
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(db_error)?
+    else {
+        return Err(AppError::new(StatusCode::NOT_FOUND, "resource not found"));
+    };
+
+    let count: i64 = row.get("count");
+    let in_use: i64 = row.get("in_use");
+    Ok(Json(ResourceResponse {
+        id: id.to_string(),
+        count,
+        in_use,
+        available: count - in_use,
+    }))
+}
+
+async fn delete_resource(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> AppResult<Json<DeleteResponse>> {
+    let id = parse_uuid(&id)?;
+    let result = sqlx::query("DELETE FROM library_resources WHERE id = $1")
+        .bind(id)
+        .execute(&state.db)
+        .await
+        .map_err(db_error)?;
+
+    Ok(Json(DeleteResponse {
+        deleted: result.rows_affected() == 1,
+    }))
+}
+
+async fn borrow_resource(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<BorrowRequest>,
+) -> AppResult<Json<BorrowResponse>> {
+    let id = parse_uuid(&id)?;
+    if body.ttl <= 0.0 {
+        return Err(AppError::new(
+            StatusCode::BAD_REQUEST,
+            "ttl must be positive",
+        ));
+    }
+    let ttl = body.ttl.clamp(0.0, state.config.library_max_ttl_seconds);
+    let wait = body.wait.clamp(0.0, state.config.library_max_wait_seconds);
+
+    let deadline = Instant::now() + Duration::from_secs_f64(wait);
+    let mut rx = state.library_tx.subscribe();
+
+    loop {
+        match try_borrow(&state, id, ttl).await? {
+            BorrowOutcome::Acquired {
+                lease,
+                position,
+                expires_at_unix,
+            } => {
+                let now = current_unix_seconds()? as i64;
+                return Ok(Json(BorrowResponse {
+                    lease: lease.to_string(),
+                    position,
+                    expires_at_unix,
+                    expires_in: (expires_at_unix - now).max(0),
+                }));
+            }
+            BorrowOutcome::Missing => {
+                return Err(AppError::new(StatusCode::NOT_FOUND, "resource not found"));
+            }
+            BorrowOutcome::Full { next_expiry } => {
+                if Instant::now() >= deadline {
+                    return Err(AppError::new(StatusCode::CONFLICT, "no resource available"));
+                }
+                let wait_deadline = match next_expiry {
+                    Some(expiry) => {
+                        let now = current_unix_seconds()? as i64;
+                        let seconds = (expiry - now).max(0) as u64;
+                        let expiry_instant = Instant::now() + Duration::from_secs(seconds);
+                        deadline.min(expiry_instant)
+                    }
+                    None => deadline,
+                };
+                if !wait_for_library_notification(&mut rx, &id.to_string(), wait_deadline).await {
+                    // timeout: take one last look
+                }
+            }
+        }
+    }
+}
+
+enum BorrowOutcome {
+    Acquired {
+        lease: Uuid,
+        position: i64,
+        expires_at_unix: i64,
+    },
+    Full {
+        next_expiry: Option<i64>,
+    },
+    Missing,
+}
+
+async fn try_borrow(state: &AppState, id: Uuid, ttl: f64) -> AppResult<BorrowOutcome> {
+    let mut tx = state.db.begin().await.map_err(db_error)?;
+
+    let Some(row) = sqlx::query("SELECT count FROM library_resources WHERE id = $1 FOR UPDATE")
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_error)?
+    else {
+        return Ok(BorrowOutcome::Missing);
+    };
+    let count: i64 = row.get("count");
+
+    sqlx::query("DELETE FROM library_leases WHERE resource_id = $1 AND expires_at <= now()")
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_error)?;
+
+    // `min(gs)` is an aggregate: it always returns exactly one row, whose value is
+    // NULL when no position is free (full pool, or count == 0 → empty series). Decode
+    // as Option<i64> with fetch_one; None means "no free slot".
+    let position = sqlx::query_scalar::<_, Option<i64>>(
+        r#"
+        SELECT min(gs)
+        FROM generate_series(0, $2 - 1) AS gs
+        WHERE NOT EXISTS (
+            SELECT 1 FROM library_leases l
+            WHERE l.resource_id = $1 AND l.position = gs
+        )
+        "#,
+    )
+    .bind(id)
+    .bind(count)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(db_error)?;
+
+    if let Some(position) = position {
+        let lease = Uuid::new_v4();
+        let row = sqlx::query(
+            r#"
+            INSERT INTO library_leases (id, resource_id, position, expires_at)
+            VALUES ($1, $2, $3, now() + ($4 * interval '1 second'))
+            RETURNING position, extract(epoch from expires_at)::bigint AS expires_at_unix
+            "#,
+        )
+        .bind(lease)
+        .bind(id)
+        .bind(position)
+        .bind(ttl)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db_error)?;
+
+        tx.commit().await.map_err(db_error)?;
+        let expires_at_unix: i64 = row.get("expires_at_unix");
+        return Ok(BorrowOutcome::Acquired {
+            lease,
+            position,
+            expires_at_unix,
+        });
+    }
+
+    let next_expiry = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT extract(epoch from min(expires_at))::bigint FROM library_leases WHERE resource_id = $1",
+    )
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(db_error)?;
+
+    Ok(BorrowOutcome::Full { next_expiry })
+}
+
+async fn return_lease(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<ReturnRequest>,
+) -> AppResult<Json<ReturnResponse>> {
+    let id = parse_uuid(&id)?;
+    let lease = Uuid::parse_str(&body.lease)
+        .map_err(|_| AppError::new(StatusCode::BAD_REQUEST, "lease must be a UUID"))?;
+
+    let result = sqlx::query(
+        "DELETE FROM library_leases WHERE id = $1 AND resource_id = $2 AND expires_at > now() RETURNING id",
+    )
+    .bind(lease)
+    .bind(id)
+    .execute(&state.db)
+    .await
+    .map_err(db_error)?;
+
+    let returned = result.rows_affected() == 1;
+    if returned {
+        notify_library(&state, &id.to_string()).await;
+    }
+
+    Ok(Json(ReturnResponse { returned }))
+}
+
+async fn notify_library(state: &AppState, id: &str) {
+    let _ = state.library_tx.send(id.to_owned());
+    if let Err(err) = sqlx::query("SELECT pg_notify($1, $2)")
+        .bind(LIBRARY_NOTIFY_CHANNEL)
+        .bind(id)
+        .execute(&state.db)
+        .await
+    {
+        error!(%err, "library notification failed");
+    }
+}
+
+async fn library_notification_worker(database_url: String, library_tx: broadcast::Sender<String>) {
+    loop {
+        match PgListener::connect(&database_url).await {
+            Ok(mut listener) => {
+                if let Err(err) = listener.listen(LIBRARY_NOTIFY_CHANNEL).await {
+                    error!(%err, "failed to listen for library notifications");
+                } else {
+                    while let Ok(notification) = listener.recv().await {
+                        let _ = library_tx.send(notification.payload().to_owned());
+                    }
+                }
+            }
+            Err(err) => {
+                error!(%err, "failed to connect library notification listener");
+            }
+        }
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+async fn wait_for_library_notification(
+    library_rx: &mut broadcast::Receiver<String>,
+    resource_id: &str,
+    deadline: Instant,
+) -> bool {
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return false;
+        };
+
+        match tokio::time::timeout(remaining, library_rx.recv()).await {
+            Ok(Ok(notified_id)) if notified_id == resource_id => return true,
+            Ok(Ok(_)) => {}
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => return true,
+            Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => return false,
+        }
+    }
 }
 
 fn docs_html_response() -> Response {
@@ -2958,6 +3378,7 @@ impl Config {
         let max_requests = env_usize("INBOX_MAX_REQUESTS", 100).max(1);
         let max_get_limit = env_usize("INBOX_MAX_GET_LIMIT", 1000).max(1);
         let default_get_limit = env_usize("INBOX_DEFAULT_GET_LIMIT", 1).clamp(1, max_get_limit);
+        let library_max_count = env_usize("LIBRARY_MAX_COUNT", 1000) as i64;
 
         Ok(Self {
             bind_addr: env::var("BIND_ADDR")
@@ -2969,6 +3390,9 @@ impl Config {
             default_get_limit,
             max_get_limit,
             long_poll_seconds: env_f64("INBOX_LONG_POLL_SECONDS", 25.0).max(0.1),
+            library_max_count,
+            library_max_ttl_seconds: env_f64("LIBRARY_MAX_TTL_SECONDS", 86_400.0).max(1.0),
+            library_max_wait_seconds: env_f64("LIBRARY_MAX_WAIT_SECONDS", 300.0).max(0.0),
         })
     }
 }
@@ -3552,5 +3976,859 @@ mod tests {
         }
 
         assert_eq!(estimate_unique_bits(&bits), 3);
+    }
+
+    // ------------------------------------------------------------------
+    // Library tests
+    // ------------------------------------------------------------------
+
+    async fn library_test_app() -> Option<(Router, PgPool)> {
+        // Skip only when no DB is configured. If DATABASE_URL is set but the database
+        // is unreachable or migration fails, panic loudly — a silent skip here would
+        // report green while testing nothing.
+        let database_url = std::env::var("DATABASE_URL").ok()?;
+        let db = PgPoolOptions::new()
+            .max_connections(5)
+            .acquire_timeout(Duration::from_secs(5))
+            .connect(&database_url)
+            .await
+            .expect("connect to DATABASE_URL");
+        migrate(&db).await.expect("run migrations");
+
+        let (inbox_tx, _) = broadcast::channel(16);
+        let (library_tx, _) = broadcast::channel(16);
+        let (stats_tx, _) = mpsc::channel(16);
+        let config = Config {
+            bind_addr: "127.0.0.1:3000".parse().unwrap(),
+            database_url,
+            max_requests: 100,
+            default_get_limit: 1,
+            max_get_limit: 1000,
+            long_poll_seconds: 25.0,
+            library_max_count: 100,
+            library_max_ttl_seconds: 60.0,
+            library_max_wait_seconds: 5.0,
+        };
+
+        let router = Router::new()
+            .route(
+                "/l/{id}",
+                put(put_resource).get(get_resource).delete(delete_resource),
+            )
+            .route("/l/{id}/borrow", post(borrow_resource))
+            .route("/l/{id}/return", post(return_lease))
+            .with_state(AppState {
+                db: db.clone(),
+                inbox_tx,
+                library_tx,
+                stats_tx,
+                config,
+            });
+
+        Some((router, db))
+    }
+
+    async fn json_body<T: serde::de::DeserializeOwned>(response: Response) -> (StatusCode, T) {
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    async fn json_status(response: Response) -> (StatusCode, serde_json::Value) {
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap_or_default())
+    }
+
+    fn library_request(method: &str, uri: &str, body: Option<String>) -> Request<Body> {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if body.is_some() {
+            builder = builder.header(header::CONTENT_TYPE, "application/json");
+        }
+        builder.body(Body::from(body.unwrap_or_default())).unwrap()
+    }
+
+    #[tokio::test]
+    async fn library_put_creates_and_updates_pool() {
+        let Some((router, db)) = library_test_app().await else {
+            return;
+        };
+        let id = Uuid::new_v4();
+
+        let (status, body): (StatusCode, ResourceResponse) = json_body(
+            router
+                .clone()
+                .oneshot(library_request(
+                    "PUT",
+                    &format!("/l/{id}"),
+                    Some(r#"{"count":4}"#.into()),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.count, 4);
+        assert_eq!(body.in_use, 0);
+        assert_eq!(body.available, 4);
+
+        let (status, body): (StatusCode, ResourceResponse) = json_body(
+            router
+                .clone()
+                .oneshot(library_request(
+                    "PUT",
+                    &format!("/l/{id}"),
+                    Some(r#"{"count":2}"#.into()),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.count, 2);
+        assert_eq!(body.available, 2);
+
+        drop(router);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn library_borrow_uses_lowest_positions_and_exhausts() {
+        let Some((router, db)) = library_test_app().await else {
+            return;
+        };
+        let id = Uuid::new_v4();
+
+        let (_status, pool): (StatusCode, ResourceResponse) = json_body(
+            router
+                .clone()
+                .oneshot(library_request(
+                    "PUT",
+                    &format!("/l/{id}"),
+                    Some(r#"{"count":3}"#.into()),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(pool.available, 3);
+
+        let mut positions = std::collections::HashSet::new();
+        for _ in 0..3 {
+            let (_status, borrow): (StatusCode, BorrowResponse) = json_body(
+                router
+                    .clone()
+                    .oneshot(library_request(
+                        "POST",
+                        &format!("/l/{id}/borrow"),
+                        Some(r#"{"ttl":30}"#.into()),
+                    ))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert!(positions.insert(borrow.position));
+            assert!((0..3).contains(&borrow.position));
+        }
+        assert_eq!(positions.len(), 3);
+
+        let (status, _body): (StatusCode, serde_json::Value) = json_status(
+            router
+                .clone()
+                .oneshot(library_request(
+                    "POST",
+                    &format!("/l/{id}/borrow"),
+                    Some(r#"{"ttl":30,"wait":0}"#.into()),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        drop(router);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn library_return_frees_slot() {
+        let Some((router, db)) = library_test_app().await else {
+            return;
+        };
+        let id = Uuid::new_v4();
+
+        let (_status, _pool): (StatusCode, ResourceResponse) = json_body(
+            router
+                .clone()
+                .oneshot(library_request(
+                    "PUT",
+                    &format!("/l/{id}"),
+                    Some(r#"{"count":2}"#.into()),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        let (_status, borrow): (StatusCode, BorrowResponse) = json_body(
+            router
+                .clone()
+                .oneshot(library_request(
+                    "POST",
+                    &format!("/l/{id}/borrow"),
+                    Some(r#"{"ttl":30}"#.into()),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let returned_position = borrow.position;
+
+        let (status, _body): (StatusCode, ReturnResponse) = json_body(
+            router
+                .clone()
+                .oneshot(library_request(
+                    "POST",
+                    &format!("/l/{id}/return"),
+                    Some(format!(r#"{{"lease":"{}"}}"#, borrow.lease)),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (_status, pool): (StatusCode, ResourceResponse) = json_body(
+            router
+                .clone()
+                .oneshot(library_request("GET", &format!("/l/{id}"), None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(pool.in_use, 0);
+        assert_eq!(pool.available, 2);
+
+        let (_status, borrow2): (StatusCode, BorrowResponse) = json_body(
+            router
+                .clone()
+                .oneshot(library_request(
+                    "POST",
+                    &format!("/l/{id}/borrow"),
+                    Some(r#"{"ttl":30}"#.into()),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(borrow2.position, returned_position);
+
+        drop(router);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn library_lease_expires_and_reuses_slot() {
+        let Some((router, db)) = library_test_app().await else {
+            return;
+        };
+        let id = Uuid::new_v4();
+
+        let (_status, _pool): (StatusCode, ResourceResponse) = json_body(
+            router
+                .clone()
+                .oneshot(library_request(
+                    "PUT",
+                    &format!("/l/{id}"),
+                    Some(r#"{"count":1}"#.into()),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        let (_status, borrow): (StatusCode, BorrowResponse) = json_body(
+            router
+                .clone()
+                .oneshot(library_request(
+                    "POST",
+                    &format!("/l/{id}/borrow"),
+                    Some(r#"{"ttl":0.5}"#.into()),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(borrow.position, 0);
+
+        // Force the lease to look expired so we don't wait on wall-clock time.
+        let lease_id = Uuid::parse_str(&borrow.lease).unwrap();
+        sqlx::query(
+            "UPDATE library_leases SET expires_at = now() - interval '1 second' WHERE id = $1",
+        )
+        .bind(lease_id)
+        .execute(&db)
+        .await
+        .unwrap();
+
+        let (_status, borrow2): (StatusCode, BorrowResponse) = json_body(
+            router
+                .clone()
+                .oneshot(library_request(
+                    "POST",
+                    &format!("/l/{id}/borrow"),
+                    Some(r#"{"ttl":30}"#.into()),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(borrow2.position, 0);
+
+        drop(router);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn library_wait_wakes_on_return() {
+        let Some((router, db)) = library_test_app().await else {
+            return;
+        };
+        let id = Uuid::new_v4();
+
+        let (_status, _pool): (StatusCode, ResourceResponse) = json_body(
+            router
+                .clone()
+                .oneshot(library_request(
+                    "PUT",
+                    &format!("/l/{id}"),
+                    Some(r#"{"count":1}"#.into()),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        let (_status, borrow): (StatusCode, BorrowResponse) = json_body(
+            router
+                .clone()
+                .oneshot(library_request(
+                    "POST",
+                    &format!("/l/{id}/borrow"),
+                    Some(r#"{"ttl":30}"#.into()),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let lease = borrow.lease.clone();
+
+        let waiter_router = router.clone();
+        let waiter_id = id;
+        let waiter = tokio::spawn(async move {
+            json_body::<BorrowResponse>(
+                waiter_router
+                    .oneshot(library_request(
+                        "POST",
+                        &format!("/l/{waiter_id}/borrow"),
+                        Some(r#"{"ttl":30,"wait":5}"#.into()),
+                    ))
+                    .await
+                    .unwrap(),
+            )
+            .await
+        });
+
+        let (_status, returned): (StatusCode, ReturnResponse) = json_body(
+            router
+                .clone()
+                .oneshot(library_request(
+                    "POST",
+                    &format!("/l/{id}/return"),
+                    Some(format!(r#"{{"lease":"{lease}"}}"#)),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(returned.returned);
+
+        let (status, borrow2) = waiter.await.unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(borrow2.position, 0);
+
+        drop(router);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn library_put_can_raise_or_lower_count() {
+        let Some((router, db)) = library_test_app().await else {
+            return;
+        };
+        let id = Uuid::new_v4();
+
+        let (_status, _pool): (StatusCode, ResourceResponse) = json_body(
+            router
+                .clone()
+                .oneshot(library_request(
+                    "PUT",
+                    &format!("/l/{id}"),
+                    Some(r#"{"count":2}"#.into()),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        let (_status, borrow): (StatusCode, BorrowResponse) = json_body(
+            router
+                .clone()
+                .oneshot(library_request(
+                    "POST",
+                    &format!("/l/{id}/borrow"),
+                    Some(r#"{"ttl":30}"#.into()),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(borrow.position, 0);
+
+        // Lower count below one occupied position.
+        let (_status, pool): (StatusCode, ResourceResponse) = json_body(
+            router
+                .clone()
+                .oneshot(library_request(
+                    "PUT",
+                    &format!("/l/{id}"),
+                    Some(r#"{"count":1}"#.into()),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(pool.count, 1);
+        assert_eq!(pool.in_use, 1);
+        assert_eq!(pool.available, 0);
+
+        // New borrows for the dropped slot should fail immediately.
+        let (status, _body): (StatusCode, serde_json::Value) = json_status(
+            router
+                .clone()
+                .oneshot(library_request(
+                    "POST",
+                    &format!("/l/{id}/borrow"),
+                    Some(r#"{"ttl":30,"wait":0}"#.into()),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        // Raise count back up makes the out-of-range slot available again.
+        let (_status, _pool): (StatusCode, ResourceResponse) = json_body(
+            router
+                .clone()
+                .oneshot(library_request(
+                    "PUT",
+                    &format!("/l/{id}"),
+                    Some(r#"{"count":2}"#.into()),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        let (_status, borrow2): (StatusCode, BorrowResponse) = json_body(
+            router
+                .clone()
+                .oneshot(library_request(
+                    "POST",
+                    &format!("/l/{id}/borrow"),
+                    Some(r#"{"ttl":30,"wait":0}"#.into()),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(borrow2.position, 1);
+
+        drop(router);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn library_concurrent_borrows_do_not_over_issue() {
+        let Some((router, db)) = library_test_app().await else {
+            return;
+        };
+        let id = Uuid::new_v4();
+        let count = 5usize;
+
+        let (_status, _pool): (StatusCode, ResourceResponse) = json_body(
+            router
+                .clone()
+                .oneshot(library_request(
+                    "PUT",
+                    &format!("/l/{id}"),
+                    Some(format!(r#"{{"count":{count}}}"#)),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        let mut handles = Vec::new();
+        for _ in 0..(count + 3) {
+            let r = router.clone();
+            handles.push(tokio::spawn(async move {
+                r.oneshot(library_request(
+                    "POST",
+                    &format!("/l/{id}/borrow"),
+                    Some(r#"{"ttl":30,"wait":0}"#.into()),
+                ))
+                .await
+                .unwrap()
+            }));
+        }
+
+        let mut positions = std::collections::HashSet::new();
+        let mut successes = 0;
+        let mut conflicts = 0;
+        for handle in handles {
+            let response = handle.await.unwrap();
+            if response.status() == StatusCode::OK {
+                let (_status, borrow): (StatusCode, BorrowResponse) = json_body(response).await;
+                assert!(positions.insert(borrow.position));
+                successes += 1;
+            } else {
+                assert_eq!(response.status(), StatusCode::CONFLICT);
+                conflicts += 1;
+            }
+        }
+        assert_eq!(successes, count);
+        assert_eq!(conflicts, 3);
+
+        drop(router);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn library_delete_removes_pool() {
+        let Some((router, db)) = library_test_app().await else {
+            return;
+        };
+        let id = Uuid::new_v4();
+
+        let (_status, _pool): (StatusCode, ResourceResponse) = json_body(
+            router
+                .clone()
+                .oneshot(library_request(
+                    "PUT",
+                    &format!("/l/{id}"),
+                    Some(r#"{"count":2}"#.into()),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        let (_status, borrow): (StatusCode, BorrowResponse) = json_body(
+            router
+                .clone()
+                .oneshot(library_request(
+                    "POST",
+                    &format!("/l/{id}/borrow"),
+                    Some(r#"{"ttl":30}"#.into()),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let lease = borrow.lease;
+
+        let (status, _body): (StatusCode, DeleteResponse) = json_body(
+            router
+                .clone()
+                .oneshot(library_request("DELETE", &format!("/l/{id}"), None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _body): (StatusCode, serde_json::Value) = json_status(
+            router
+                .clone()
+                .oneshot(library_request("GET", &format!("/l/{id}"), None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, body): (StatusCode, ReturnResponse) = json_body(
+            router
+                .clone()
+                .oneshot(library_request(
+                    "POST",
+                    &format!("/l/{id}/return"),
+                    Some(format!(r#"{{"lease":"{lease}"}}"#)),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!body.returned);
+
+        drop(router);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn library_validation_errors() {
+        let Some((router, db)) = library_test_app().await else {
+            return;
+        };
+        let id = Uuid::new_v4();
+
+        let (status, _body): (StatusCode, serde_json::Value) = json_status(
+            router
+                .clone()
+                .oneshot(library_request("GET", "/l/not-a-uuid", None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, _body): (StatusCode, serde_json::Value) = json_status(
+            router
+                .clone()
+                .oneshot(library_request(
+                    "PUT",
+                    &format!("/l/{id}"),
+                    Some(r#"{"count":-1}"#.into()),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, _body): (StatusCode, serde_json::Value) = json_status(
+            router
+                .clone()
+                .oneshot(library_request(
+                    "PUT",
+                    &format!("/l/{id}"),
+                    Some(r#"{"count":1000}"#.into()),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, _body): (StatusCode, serde_json::Value) = json_status(
+            router
+                .clone()
+                .oneshot(library_request(
+                    "POST",
+                    &format!("/l/{id}/borrow"),
+                    Some(r#"{"ttl":0}"#.into()),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, _body): (StatusCode, serde_json::Value) = json_status(
+            router
+                .clone()
+                .oneshot(library_request("GET", &format!("/l/{id}"), None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, body): (StatusCode, ReturnResponse) = json_body(
+            router
+                .clone()
+                .oneshot(library_request(
+                    "POST",
+                    &format!("/l/{id}/return"),
+                    Some(r#"{"lease":"00000000-0000-0000-0000-000000000000"}"#.into()),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!body.returned);
+
+        drop(router);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn library_zero_count_pool_conflicts() {
+        let Some((router, db)) = library_test_app().await else {
+            return;
+        };
+        let id = Uuid::new_v4();
+
+        let (status, body): (StatusCode, ResourceResponse) = json_body(
+            router
+                .clone()
+                .oneshot(library_request(
+                    "PUT",
+                    &format!("/l/{id}"),
+                    Some(r#"{"count":0}"#.into()),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.available, 0);
+
+        // A zero-capacity pool can never lend; borrow fails fast with 409.
+        let (status, _body): (StatusCode, serde_json::Value) = json_status(
+            router
+                .clone()
+                .oneshot(library_request(
+                    "POST",
+                    &format!("/l/{id}/borrow"),
+                    Some(r#"{"ttl":30,"wait":0}"#.into()),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        drop(router);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn library_raise_count_wakes_waiter() {
+        let Some((router, db)) = library_test_app().await else {
+            return;
+        };
+        let id = Uuid::new_v4();
+
+        // Pool of 1, fully borrowed.
+        let _ = router
+            .clone()
+            .oneshot(library_request(
+                "PUT",
+                &format!("/l/{id}"),
+                Some(r#"{"count":1}"#.into()),
+            ))
+            .await
+            .unwrap();
+        let _ = router
+            .clone()
+            .oneshot(library_request(
+                "POST",
+                &format!("/l/{id}/borrow"),
+                Some(r#"{"ttl":30}"#.into()),
+            ))
+            .await
+            .unwrap();
+
+        // A waiter blocks because the only slot is taken.
+        let waiter_router = router.clone();
+        let waiter = tokio::spawn(async move {
+            json_body::<BorrowResponse>(
+                waiter_router
+                    .oneshot(library_request(
+                        "POST",
+                        &format!("/l/{id}/borrow"),
+                        Some(r#"{"ttl":30,"wait":5}"#.into()),
+                    ))
+                    .await
+                    .unwrap(),
+            )
+            .await
+        });
+
+        // Let the waiter subscribe and block (no sleep — just yield the executor).
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+
+        // Raising the count opens slot 1 and must wake the waiter.
+        let _ = router
+            .clone()
+            .oneshot(library_request(
+                "PUT",
+                &format!("/l/{id}"),
+                Some(r#"{"count":2}"#.into()),
+            ))
+            .await
+            .unwrap();
+
+        let (status, borrow) = waiter.await.unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(borrow.position, 1);
+
+        drop(router);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn library_lease_expiry_wakes_waiter() {
+        let Some((router, db)) = library_test_app().await else {
+            return;
+        };
+        let id = Uuid::new_v4();
+
+        // Pool of 1; hold the only slot for a short ttl.
+        let _ = router
+            .clone()
+            .oneshot(library_request(
+                "PUT",
+                &format!("/l/{id}"),
+                Some(r#"{"count":1}"#.into()),
+            ))
+            .await
+            .unwrap();
+        let _ = router
+            .clone()
+            .oneshot(library_request(
+                "POST",
+                &format!("/l/{id}/borrow"),
+                Some(r#"{"ttl":0.3}"#.into()),
+            ))
+            .await
+            .unwrap();
+
+        // The waiter gets no return notification; it must self-wake when the held
+        // lease expires (the next_expiry timer path), then claim the freed slot.
+        let (status, borrow) = json_body::<BorrowResponse>(
+            router
+                .clone()
+                .oneshot(library_request(
+                    "POST",
+                    &format!("/l/{id}/borrow"),
+                    Some(r#"{"ttl":30,"wait":5}"#.into()),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(borrow.position, 0);
+
+        drop(router);
+        db.close().await;
     }
 }

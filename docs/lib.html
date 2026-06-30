@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>cc.me docs — Library</title>
+    <meta
+      name="description"
+      content="A distributed semaphore: register a pool of N under a secret UUID, borrow leases that auto-expire, return them early."
+    />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="go-import" content="cc.me git https://github.com/xmit-co/cc.me" />
+    <meta
+      name="go-source"
+      content="cc.me https://github.com/xmit-co/cc.me https://github.com/xmit-co/cc.me/tree/main{/dir} https://github.com/xmit-co/cc.me/blob/main{/dir}/{file}#L{line}"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header>
+      <span class="brand"><a href="/">cc.me</a> / Library</span>
+      <nav aria-label="Sections">
+        <a href="#use-cases">Use cases</a>
+        <a href="#model">Model</a>
+        <a href="#resources">Resources</a>
+        <a href="#borrow">Borrowing</a>
+        <a href="#return">Returning</a>
+        <a href="#errors">Errors</a>
+      </nav>
+    </header>
+
+    <main>
+      <section class="intro">
+        <h1>Library.</h1>
+        <p>
+          A distributed semaphore over HTTP. Register a pool of <code>count</code> numbered slots
+          under a secret UUID, then <strong>borrow</strong> one for a bounded time, optionally
+          waiting for a slot to free up — each borrow hands you a slot <code>position</code> in
+          <code>0 … count − 1</code>. <strong>Return</strong> a lease early by its UUID, or let it
+          expire on its own. Whoever holds the resource UUID may borrow — the UUID is the only
+          credential.
+        </p>
+      </section>
+
+      <section id="use-cases">
+        <h2>Use cases</h2>
+        <ul class="use-cases">
+          <li>
+            <strong>Concurrency limits.</strong> Cap how many workers hit a fragile upstream, a rate
+            limited API, or a license seat at once — without running your own coordination service.
+          </li>
+          <li>
+            <strong>Mutual exclusion.</strong> Register a pool of <code>1</code> to get a lease-based
+            lock with an automatic timeout, so a crashed holder never wedges the resource forever.
+          </li>
+          <li>
+            <strong>Pools of scarce things.</strong> Hand out a bounded set of test accounts, device
+            slots, GPU shares, or staging environments to many clients, first come first served.
+          </li>
+          <li>
+            <strong>Backpressure.</strong> Let clients block for a bounded window when the pool is
+            exhausted, instead of polling, and wake the instant a permit returns.
+          </li>
+        </ul>
+      </section>
+
+      <section id="model">
+        <h2>Model</h2>
+        <p>
+          A <strong>resource</strong> is a pool of <code>count</code> numbered slots, identified by a
+          UUID you choose. The slots are the integers <code>0 … count − 1</code>. A
+          <strong>lease</strong> is one held slot, identified by its own server-generated UUID, with
+          an expiry; borrowing hands you the lowest free slot's <code>position</code>. At any instant
+          the pool has <code>in_use</code> active (unexpired, unreturned) leases and
+          <code>available = count − in_use</code> free slots.
+        </p>
+        <ul>
+          <li>
+            <strong>Positions are stable and dense.</strong> With <code>count = 4</code> a borrow
+            returns one of <code>0, 1, 2, 3</code> — always the lowest that is free — and a returned
+            or expired slot is the next one handed back out.
+          </li>
+          <li>
+            The resource UUID is a <strong>secret</strong>. Anyone who has it can inspect, borrow,
+            register, or delete the pool, so treat it like a bearer token. Pick an unguessable
+            random UUID — a v4 UUID has 122 bits of entropy.
+          </li>
+          <li>
+            <strong>Borrow</strong> takes a permit for up to <code>ttl</code> seconds. If the pool is
+            exhausted, the call waits up to <code>wait</code> seconds and returns the first permit
+            that frees up; if none frees up in time it fails with <code>409</code>.
+          </li>
+          <li>
+            A lease is freed by an explicit <strong>return</strong> or automatically when its
+            <code>ttl</code> elapses, whichever comes first. There is no renewal: borrow again for a
+            longer hold. Lowering <code>count</code> never revokes outstanding leases; it only
+            withholds new ones until enough free up.
+          </li>
+          <li>
+            All IDs are UUIDs. All bodies and responses are JSON. There are no auth headers — the
+            URL's resource UUID is the credential.
+          </li>
+        </ul>
+      </section>
+
+      <section id="resources">
+        <h2>Resources</h2>
+        <h3>Register a pool</h3>
+        <p>
+          <code>PUT /l/&lt;id&gt;</code> registers the pool at the UUID you choose with a
+          <code>count</code>. It is idempotent: the same call on an existing pool updates its
+          <code>count</code>, so this is also how you grow or shrink the pool. Raising
+          <code>count</code> can immediately satisfy waiting borrowers; lowering it below
+          <code>in_use</code> does not recall live leases — it just blocks new borrows until enough
+          expire or return. <code>count</code> must be between <code>0</code> and <code>1000</code>.
+        </p>
+        <pre><code class="language-http"><span class="tok-method">PUT</span> <span class="tok-path">/l/9f1c2e7a-5b3d-4c8e-a1f0-6d2b9c4e7a01</span>
+
+{
+  <span class="tok-str">"count"</span>: <span class="tok-num">4</span>
+}</code></pre>
+        <pre><code class="language-json">{
+  <span class="tok-str">"id"</span>: <span class="tok-str">"9f1c2e7a-5b3d-4c8e-a1f0-6d2b9c4e7a01"</span>,
+  <span class="tok-str">"count"</span>: <span class="tok-num">4</span>,
+  <span class="tok-str">"in_use"</span>: <span class="tok-num">0</span>,
+  <span class="tok-str">"available"</span>: <span class="tok-num">4</span>
+}</code></pre>
+
+        <h3>Inspect</h3>
+        <p>
+          <code>GET /l/&lt;id&gt;</code> returns the current pool state. It does not reveal lease UUIDs —
+          those are separate secrets held by borrowers.
+        </p>
+        <pre><code class="language-http"><span class="tok-method">GET</span> <span class="tok-path">/l/9f1c2e7a-5b3d-4c8e-a1f0-6d2b9c4e7a01</span></code></pre>
+        <pre><code class="language-json">{
+  <span class="tok-str">"id"</span>: <span class="tok-str">"9f1c2e7a-5b3d-4c8e-a1f0-6d2b9c4e7a01"</span>,
+  <span class="tok-str">"count"</span>: <span class="tok-num">4</span>,
+  <span class="tok-str">"in_use"</span>: <span class="tok-num">2</span>,
+  <span class="tok-str">"available"</span>: <span class="tok-num">2</span>
+}</code></pre>
+
+        <h3>Delete</h3>
+        <p>
+          <code>DELETE /l/&lt;id&gt;</code> removes the pool and all of its leases. Outstanding lease
+          UUIDs stop being valid. The call is idempotent.
+        </p>
+        <pre><code class="language-http"><span class="tok-method">DELETE</span> <span class="tok-path">/l/9f1c2e7a-5b3d-4c8e-a1f0-6d2b9c4e7a01</span></code></pre>
+        <pre><code class="language-json">{
+  <span class="tok-str">"deleted"</span>: <span class="tok-bool">true</span>
+}</code></pre>
+      </section>
+
+      <section id="borrow">
+        <h2>Borrowing</h2>
+        <p>
+          <code>POST /l/&lt;id&gt;/borrow</code> reserves one permit. <code>ttl</code> (seconds) is how
+          long the lease is held before it auto-expires. <code>wait</code> (seconds, default
+          <code>0</code>) is how long the call may block when the pool is exhausted. Both are clamped
+          to their configured maximums.
+        </p>
+        <pre><code class="language-http"><span class="tok-method">POST</span> <span class="tok-path">/l/9f1c2e7a-5b3d-4c8e-a1f0-6d2b9c4e7a01/borrow</span>
+
+{
+  <span class="tok-str">"ttl"</span>: <span class="tok-num">30</span>,
+  <span class="tok-str">"wait"</span>: <span class="tok-num">25</span>
+}</code></pre>
+        <p>
+          On success the response carries the lease UUID, the slot <code>position</code> you were
+          given, and the expiry:
+        </p>
+        <pre><code class="language-json">{
+  <span class="tok-str">"lease"</span>: <span class="tok-str">"3a7d0b14-9e2c-4f6a-8b1d-0c5e2f9a7b34"</span>,
+  <span class="tok-str">"position"</span>: <span class="tok-num">0</span>,
+  <span class="tok-str">"expires_at_unix"</span>: <span class="tok-num">1781337630</span>,
+  <span class="tok-str">"expires_in"</span>: <span class="tok-num">30</span>
+}</code></pre>
+        <ul>
+          <li>
+            If a permit is free, the call returns immediately. Otherwise it blocks and is woken the
+            instant a permit is returned, a lease expires, or the count is raised — re-checking
+            atomically each time so concurrent borrowers never over-issue.
+          </li>
+          <li>
+            If no permit frees up within <code>wait</code> seconds, the call returns
+            <code>409 {"error":"no resource available"}</code>. With <code>wait: 0</code> an exhausted
+            pool fails right away.
+          </li>
+          <li>
+            Hold the returned <code>lease</code> UUID — you need it to return early. If you lose it,
+            the permit still frees itself after <code>ttl</code> seconds.
+          </li>
+        </ul>
+      </section>
+
+      <section id="return">
+        <h2>Returning</h2>
+        <p>
+          <code>POST /l/&lt;id&gt;/return</code> frees a lease before its <code>ttl</code> elapses and
+          wakes any borrower waiting on the pool. It is idempotent: returning an already-expired,
+          already-returned, or unknown lease reports <code>returned: false</code>.
+        </p>
+        <pre><code class="language-http"><span class="tok-method">POST</span> <span class="tok-path">/l/9f1c2e7a-5b3d-4c8e-a1f0-6d2b9c4e7a01/return</span>
+
+{
+  <span class="tok-str">"lease"</span>: <span class="tok-str">"3a7d0b14-9e2c-4f6a-8b1d-0c5e2f9a7b34"</span>
+}</code></pre>
+        <pre><code class="language-json">{
+  <span class="tok-str">"returned"</span>: <span class="tok-bool">true</span>
+}</code></pre>
+        <p>
+          You never have to return: every lease is freed automatically <code>ttl</code> seconds after
+          it was borrowed. Returning early just makes the permit available sooner. Pick a
+          <code>ttl</code> long enough to finish the work but short enough that a crashed holder
+          doesn't strand the permit.
+        </p>
+      </section>
+
+      <section id="errors">
+        <h2>Errors</h2>
+        <p>
+          Errors use the HTTP status plus a compact JSON body. Treat <code>5xx</code> as retryable
+          with backoff; treat <code>4xx</code> as a caller problem to fix first.
+        </p>
+        <pre><code class="language-json">{
+  <span class="tok-str">"error"</span>: <span class="tok-str">"human-readable reason"</span>
+}</code></pre>
+        <dl>
+          <dt><code>400</code></dt>
+          <dd>
+            Malformed JSON, an ID that is not a UUID, or <code>count</code>, <code>ttl</code>, or
+            <code>wait</code> outside the allowed range.
+          </dd>
+          <dt><code>404</code></dt>
+          <dd>No pool exists for that resource UUID (it was never registered or was deleted).</dd>
+          <dt><code>409</code></dt>
+          <dd>
+            Borrow could not acquire a permit within <code>wait</code> seconds. Retry later or with a
+            longer <code>wait</code>.
+          </dd>
+          <dt><code>502</code></dt>
+          <dd>The database command failed. Safe to retry.</dd>
+        </dl>
+      </section>
+
+      <footer>
+        By <a href="https://xmit.dev/">xmit dev team</a>. The resource UUID is your only secret —
+        share it carefully and rotate by registering a new pool.
+      </footer>
+    </main>
+  </body>
+</html>

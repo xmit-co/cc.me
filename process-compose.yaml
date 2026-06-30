@@ -6,8 +6,8 @@ environment:
   - PGPORT=55432
   - PGDATABASE=cc_me
   - PGUSER=cc_me
-  - DATABASE_URL=postgres://cc_me@127.0.0.1:55432/cc_me
   - BIND_ADDR=127.0.0.1:3000
+  # DATABASE_URL comes from .envrc (direnv), inherited here.
 
 processes:
   postgres-init:

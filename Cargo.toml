@@ -15,8 +15,9 @@ ed25519-dalek = "2.2.0"
 sha2 = "0.10"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.149"
-sqlx = { version = "0.8.6", default-features = false, features = ["macros", "postgres", "runtime-tokio-rustls"] }
+sqlx = { version = "0.8.6", default-features = false, features = ["macros", "postgres", "runtime-tokio-rustls", "uuid"] }
 time = { version = "0.3", features = ["formatting"] }
+uuid = { version = "1", features = ["v4", "serde"] }
 tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread", "signal"] }
 tower-http = { version = "0.6.6", features = ["cors"] }
 tracing = "0.1.41"
