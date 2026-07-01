@@ -5,6 +5,8 @@ import nacl from "tweetnacl";
 const DEFAULT_BASE_URL = "https://cc.me/";
 const SEALED_BOX_PUBLIC_KEY_BYTES = 32;
 const SEALED_BOX_NONCE_BYTES = 24;
+const SECRET_KEY_BYTES = 32;
+const SECRET_NONCE_BYTES = 24;
 const AUTH_VERSION = "cc-me-v1";
 const AUTH_TIMESTAMP_HEADER = "x-cc-me-timestamp";
 const AUTH_SIGNATURE_HEADER = "x-cc-me-signature";
@@ -118,6 +120,128 @@ export async function createAlias(target, options = {}) {
     signal: options.signal,
   });
   return parseJsonResponse(response);
+}
+
+export async function createSecret(plaintext, options = {}) {
+  const fetchFn = options.fetch ?? globalThis.fetch;
+  if (!fetchFn) {
+    throw new TypeError("fetch is required in this runtime");
+  }
+
+  const key = nacl.randomBytes(SECRET_KEY_BYTES);
+  const nonce = nacl.randomBytes(SECRET_NONCE_BYTES);
+  const box = nacl.secretbox(encoder.encode(String(plaintext)), nonce, key);
+  if (!box) {
+    throw new Error("encryption failed");
+  }
+
+  const payload = new Uint8Array(nonce.length + box.length);
+  payload.set(nonce);
+  payload.set(box, nonce.length);
+
+  const body = {
+    ciphertext: bytesToBase64Url(payload),
+    expires_hours: options.expiresHours,
+    auto_destroy: options.autoDestroy ?? true,
+  };
+
+  const response = await fetchFn(new URL("/p", options.baseUrl ?? DEFAULT_BASE_URL), {
+    method: "POST",
+    headers: jsonHeaders(options.headers),
+    body: JSON.stringify(body),
+    signal: options.signal,
+  });
+  const result = await parseJsonResponse(response);
+  return {
+    id: result.id,
+    url: `${result.url}#${bytesToBase64Url(key)}`,
+  };
+}
+
+export async function readSecret(urlOrId, options = {}) {
+  const fetchFn = options.fetch ?? globalThis.fetch;
+  if (!fetchFn) {
+    throw new TypeError("fetch is required in this runtime");
+  }
+
+  const { id, key } = parseSecretUrl(urlOrId, options.key);
+  if (key.length !== SECRET_KEY_BYTES) {
+    throw new TypeError(`key must be ${SECRET_KEY_BYTES} bytes`);
+  }
+
+  const baseUrl = options.baseUrl ?? DEFAULT_BASE_URL;
+  const response = await fetchFn(new URL(`/p/${id}/content`, baseUrl), {
+    headers: options.headers,
+    signal: options.signal,
+  });
+
+  if (response.status === 410) {
+    throw new Error("secret has already been read or has expired");
+  }
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    throw new Error(body.error || `HTTP ${response.status}`);
+  }
+
+  const { ciphertext } = await response.json();
+  const payload = base64UrlToBytes(ciphertext);
+  if (payload.length < SECRET_NONCE_BYTES + nacl.secretbox.overheadLength) {
+    throw new Error("ciphertext is too short");
+  }
+  const nonce = payload.slice(0, SECRET_NONCE_BYTES);
+  const box = payload.slice(SECRET_NONCE_BYTES);
+  const plaintext = nacl.secretbox.open(box, nonce, key);
+  if (!plaintext) {
+    throw new Error("decryption failed — the key may be incorrect");
+  }
+  return decoder.decode(plaintext);
+}
+
+export async function burnSecret(urlOrId, options = {}) {
+  const fetchFn = options.fetch ?? globalThis.fetch;
+  if (!fetchFn) {
+    throw new TypeError("fetch is required in this runtime");
+  }
+
+  const { id } = parseSecretUrl(urlOrId, options.key);
+  const baseUrl = options.baseUrl ?? DEFAULT_BASE_URL;
+  const response = await fetchFn(new URL(`/p/${id}`, baseUrl), {
+    method: "DELETE",
+    headers: options.headers,
+    signal: options.signal,
+  });
+
+  if (response.status === 410) {
+    throw new Error("secret has already been read or has expired");
+  }
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    throw new Error(body.error || `HTTP ${response.status}`);
+  }
+}
+
+function parseSecretUrl(urlOrId, keyOption) {
+  let id;
+  let key;
+  if (urlOrId.includes("/")) {
+    const url = new URL(urlOrId);
+    const parts = url.pathname.split("/");
+    id = parts[parts.length - 1];
+    if (url.hash.length > 1) {
+      key = base64UrlToBytes(url.hash.slice(1));
+    } else if (keyOption) {
+      key = keyToBytes(keyOption);
+    } else {
+      throw new TypeError("decryption key required when URL has no fragment");
+    }
+  } else {
+    id = urlOrId;
+    if (!keyOption) {
+      throw new TypeError("decryption key required when only an id is provided");
+    }
+    key = keyToBytes(keyOption);
+  }
+  return { id, key };
 }
 
 function publicInboxUrl(publicKey, options = {}) {

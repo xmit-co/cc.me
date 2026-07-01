@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>cc.me — view a secret</title>
+<style nonce="{{nonce}}">
+  :root { --bg: #0d1117; --fg: #c9d1d9; --accent: #58a6ff; --error: #f85149; --ok: #3fb950; }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: var(--bg); color: var(--fg); max-width: 720px; margin: 0 auto; padding: 2rem 1rem; line-height: 1.5; }
+  h1 { font-weight: 600; margin-bottom: 0.25rem; }
+  p.subtitle { color: #8b949e; margin-top: 0; }
+  #status { margin: 1.5rem 0; padding: 1rem; border-radius: 6px; background: #161b22; border: 1px solid #30363d; }
+  #status.error { border-color: var(--error); color: var(--error); }
+  #plaintext { width: 100%; min-height: 180px; padding: 0.75rem; border: 1px solid #30363d; border-radius: 6px; background: #0d1117; color: var(--fg); font-family: ui-monospace, monospace; font-size: inherit; resize: vertical; }
+  #context { color: #d29922; margin: 1rem 0; }
+  button { font: inherit; padding: 0.5rem 0.75rem; border-radius: 6px; border: 1px solid #30363d; background: #161b22; color: var(--fg); cursor: pointer; }
+  .note { font-size: 0.85rem; color: #8b949e; margin-top: 1rem; }
+</style>
+</head>
+<body>
+  <h1>View a secret</h1>
+  <p class="subtitle">This link deletes itself after reading unless the sender chose otherwise.</p>
+
+  <div id="status">Loading…</div>
+  <textarea id="plaintext" readonly style="display:none;"></textarea>
+  <p id="context" style="display:none;"></p>
+  <button id="burn" style="display:none; margin-top: 0.5rem;">Burn this secret now</button>
+
+  <p class="note">The decryption key never left your browser; it was read from the part of the URL after <code>#</code>.</p>
+
+<script src="/tweetnacl.js" nonce="{{nonce}}"></script>
+<script nonce="{{nonce}}">
+  const $ = id => document.getElementById(id);
+  const decoder = new TextDecoder();
+
+  function base64UrlToBytes(value) {
+    const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = normalized.padEnd(normalized.length + ((4 - (normalized.length % 4)) % 4), "=");
+    const binary = atob(padded);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  }
+
+  async function loadSecret() {
+    const hash = location.hash;
+    if (!hash || hash.length <= 1) {
+      showError("Missing decryption key. The part of the URL after # is required.");
+      return;
+    }
+
+    const key = base64UrlToBytes(hash.slice(1));
+    if (key.length !== 32) {
+      showError("Invalid decryption key.");
+      return;
+    }
+
+    const id = location.pathname.split("/").pop();
+
+    try {
+      const response = await fetch(`/p/${id}/content`);
+      if (response.status === 410) {
+        showError("This secret has already been read or has expired.");
+        history.replaceState(null, "", location.pathname);
+        return;
+      }
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.error || `HTTP ${response.status}`);
+      }
+
+      const { ciphertext, auto_destroy } = await response.json();
+      const payload = base64UrlToBytes(ciphertext);
+      const nonce = payload.slice(0, 24);
+      const box = payload.slice(24);
+      const plaintext = nacl.secretbox.open(box, nonce, key);
+      if (!plaintext) {
+        throw new Error("decryption failed — the key may be incorrect");
+      }
+
+      $("status").style.display = "none";
+      $("plaintext").value = decoder.decode(plaintext);
+      $("plaintext").style.display = "block";
+      $("context").style.display = "block";
+
+      if (auto_destroy) {
+        $("context").textContent = "This secret has been deleted from the server. Make sure you have saved anything you need.";
+      } else {
+        $("context").textContent = "This is a reusable secret. It stays available until it expires, or you can burn it now.";
+        $("burn").style.display = "inline-block";
+      }
+
+      history.replaceState(null, "", location.pathname);
+    } catch (err) {
+      showError(err.message || "failed to load secret");
+    }
+  }
+
+  function showError(message) {
+    $("status").textContent = message;
+    $("status").className = "error";
+  }
+
+  async function burnSecret() {
+    const id = location.pathname.split("/").pop();
+    $("burn").disabled = true;
+    try {
+      const response = await fetch(`/p/${id}`, { method: "DELETE" });
+      if (response.status === 410) {
+        showError("This secret has already been burned or has expired.");
+      } else if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      } else {
+        $("context").textContent = "Secret burned.";
+        $("burn").style.display = "none";
+      }
+    } catch (err) {
+      showError(err.message || "failed to burn secret");
+      $("burn").disabled = false;
+    }
+  }
+
+  $("burn").addEventListener("click", burnSecret);
+  loadSecret();
+</script>
+</body>
+</html>

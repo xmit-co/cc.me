@@ -52,6 +52,7 @@ const DOCS_INDEX_HTML: &str = include_str!("../docs/index.html");
 const DOCS_HTTP_HTML: &str = include_str!("../docs/http.html");
 const DOCS_LIB_HTML: &str = include_str!("../docs/lib.html");
 const DOCS_STYLES_CSS: &str = include_str!("../docs/styles.css");
+const TWEETNACL_JS: &str = include_str!("../docs/tweetnacl.js");
 const DOCS_CSP: &str = "frame-ancestors https://pcarrier.com";
 const EMAIL_ALIAS_DOMAIN: &str = "cc.me";
 const EMAIL_KEY_BYTES: usize = 32;
@@ -79,6 +80,14 @@ const STATS_HOURS: u64 = 48;
 const STATS_DAYS: u64 = 30;
 const STATS_CHANNEL_CAPACITY: usize = 4096;
 const STATS_BATCH_MAX: usize = 256;
+const SECRET_ID_BYTES: usize = 12;
+const SECRET_NONCE_BYTES: usize = 24;
+const SECRET_DEFAULT_TTL_HOURS: u64 = 24;
+const SECRET_MAX_TTL_HOURS: u64 = 168;
+const SECRET_MAX_BYTES: usize = 256 * 1024;
+const SECRET_MAX_REQUEST_BYTES: usize = 512 * 1024;
+const SECRET_CLEANUP_INTERVAL_SECONDS: u64 = 60;
+const SECRET_CSP_NONCE_BYTES: usize = 16;
 
 static EVENT_COUNTER: AtomicU64 = AtomicU64::new(0);
 static EVENT_PREFIX: LazyLock<String> = LazyLock::new(|| {
@@ -110,6 +119,10 @@ struct Config {
     library_max_count: i64,
     library_max_ttl_seconds: f64,
     library_max_wait_seconds: f64,
+    secret_default_ttl_hours: u64,
+    secret_max_ttl_hours: u64,
+    secret_max_bytes: usize,
+    secret_cleanup_interval_seconds: u64,
 }
 
 #[derive(Debug)]
@@ -303,6 +316,32 @@ struct DeleteResponse {
     deleted: bool,
 }
 
+#[derive(Deserialize)]
+struct CreateSecretRequest {
+    ciphertext: String,
+    expires_hours: Option<u64>,
+    #[serde(default = "default_auto_destroy")]
+    auto_destroy: bool,
+}
+
+fn default_auto_destroy() -> bool {
+    true
+}
+
+#[derive(Serialize)]
+struct CreateSecretResponse {
+    id: String,
+    url: String,
+}
+
+#[derive(Serialize)]
+struct SecretContentResponse {
+    ciphertext: String,
+    created_at_unix: u64,
+    expires_at_unix: u64,
+    auto_destroy: bool,
+}
+
 #[derive(Serialize)]
 struct StatsResponse {
     now_unix: u64,
@@ -320,6 +359,7 @@ struct StatsBucket {
     inboxed_messages: usize,
     aliases: usize,
     forwarded: usize,
+    secrets: usize,
 }
 
 #[derive(Serialize)]
@@ -329,6 +369,7 @@ struct StatCounts {
     inboxed_messages: usize,
     aliases: usize,
     forwarded: usize,
+    secrets: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -384,6 +425,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (stats_tx, stats_rx) = mpsc::channel(STATS_CHANNEL_CAPACITY);
     tokio::spawn(stats_worker(db.clone(), stats_rx));
+    tokio::spawn(secret_cleanup_worker(
+        db.clone(),
+        config.secret_cleanup_interval_seconds,
+    ));
 
     let app = Router::new()
         .route("/", get(root))
@@ -396,6 +441,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/l/{id}/borrow", post(borrow_resource))
         .route("/l/{id}/return", post(return_lease))
         .route("/styles.css", get(docs_styles))
+        .route("/tweetnacl.js", get(tweetnacl_js))
         .route("/hi", get(email_page))
         .route("/email/session", post(email_session))
         .route("/email/aliases", post(create_email_alias))
@@ -424,13 +470,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/i/{public_key}/claim", post(claim_inbox))
         .route("/i/{public_key}/ack", post(ack_inbox))
         .route("/i/{public_key}/release", post(release_inbox))
+        .route("/p", get(paste_create_page).post(create_secret))
+        .route("/p/{id}", get(paste_view_page).delete(burn_secret))
+        .route("/p/{id}/content", get(read_secret_content))
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
                 .allow_methods(Any)
                 .allow_headers(Any),
         )
-        .layer(DefaultBodyLimit::max(MAX_CAPTURE_BYTES))
+        .layer(DefaultBodyLimit::max(MAX_CAPTURE_BYTES.max(SECRET_MAX_REQUEST_BYTES)))
         .layer(middleware::from_fn(serve_go_import))
         .with_state(AppState {
             db,
@@ -752,6 +801,20 @@ async fn migrate(db: &PgPool) -> Result<(), sqlx::Error> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS secrets (
+            id text PRIMARY KEY,
+            ciphertext bytea NOT NULL,
+            auto_destroy boolean NOT NULL DEFAULT true,
+            created_at timestamptz NOT NULL DEFAULT now(),
+            expires_at timestamptz NOT NULL
+        )
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS library_leases (
             id          uuid PRIMARY KEY,
             resource_id uuid NOT NULL REFERENCES library_resources(id) ON DELETE CASCADE,
@@ -782,6 +845,16 @@ async fn migrate(db: &PgPool) -> Result<(), sqlx::Error> {
     .execute(db)
     .await?;
 
+    sqlx::query("CREATE INDEX IF NOT EXISTS secrets_expires_at_idx ON secrets (expires_at)")
+        .execute(db)
+        .await?;
+
+    sqlx::query(
+        "ALTER TABLE secrets ADD COLUMN IF NOT EXISTS auto_destroy boolean NOT NULL DEFAULT true",
+    )
+    .execute(db)
+    .await?;
+
     Ok(())
 }
 
@@ -807,6 +880,17 @@ async fn docs_styles() -> impl IntoResponse {
             (header::CACHE_CONTROL, "public, max-age=300"),
         ],
         DOCS_STYLES_CSS,
+    )
+}
+
+async fn tweetnacl_js() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "public, max-age=300"),
+        ],
+        TWEETNACL_JS,
     )
 }
 
@@ -1393,6 +1477,163 @@ async fn alias_redirect(
     let response = redirect(target.as_str())?;
     record_stat_soon(&state, StatKind::Redirect, None);
     Ok(response)
+}
+
+async fn paste_create_page(State(_state): State<AppState>) -> AppResult<Response> {
+    let nonce = csp_nonce()?;
+    let html = include_str!("paste_create.html").replace("{{nonce}}", &nonce);
+    Ok(secret_page_response(&html, &nonce))
+}
+
+async fn paste_view_page(State(_state): State<AppState>, Path(_id): Path<String>) -> AppResult<Response> {
+    let nonce = csp_nonce()?;
+    let html = include_str!("paste_view.html").replace("{{nonce}}", &nonce);
+    Ok(secret_page_response(&html, &nonce))
+}
+
+fn secret_page_response(html: &str, nonce: &str) -> Response {
+    let csp = format!(
+        "default-src 'none'; script-src 'nonce-{0}' 'self'; style-src 'nonce-{0}'; connect-src 'self'; base-uri 'none'",
+        nonce
+    );
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, "text/html; charset=utf-8".parse().unwrap());
+    headers.insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+    headers.insert(
+        header::HeaderName::from_static("referrer-policy"),
+        "no-referrer".parse().unwrap(),
+    );
+    headers.insert(header::CONTENT_SECURITY_POLICY, csp.parse().unwrap());
+    (StatusCode::OK, headers, html.to_owned()).into_response()
+}
+
+fn csp_nonce() -> AppResult<String> {
+    let mut bytes = [0u8; SECRET_CSP_NONCE_BYTES];
+    OsRng
+        .unwrap_err()
+        .try_fill_bytes(&mut bytes)
+        .map_err(|_| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "randomness failed"))?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+async fn create_secret(
+    State(state): State<AppState>,
+    Json(body): Json<CreateSecretRequest>,
+) -> AppResult<(StatusCode, Json<CreateSecretResponse>)> {
+    let ciphertext = decode_secret_ciphertext(&state.config, &body.ciphertext)?;
+    let ttl_hours = body
+        .expires_hours
+        .unwrap_or(state.config.secret_default_ttl_hours)
+        .clamp(1, state.config.secret_max_ttl_hours);
+    let id = insert_secret(&state, &ciphertext, body.auto_destroy, ttl_hours).await?;
+    record_stat_soon(&state, StatKind::Secret, None);
+
+    Ok((
+        StatusCode::CREATED,
+        Json(CreateSecretResponse {
+            id: id.clone(),
+            url: format!("{PUBLIC_BASE_URL}/p/{id}"),
+        }),
+    ))
+}
+
+async fn insert_secret(
+    state: &AppState,
+    ciphertext: &[u8],
+    auto_destroy: bool,
+    ttl_hours: u64,
+) -> AppResult<String> {
+    for _ in 0..4 {
+        let id = random_secret_id()?;
+        let inserted = sqlx::query_scalar::<_, String>(
+            r#"
+            INSERT INTO secrets (id, ciphertext, auto_destroy, expires_at)
+            VALUES ($1, $2, $3, now() + make_interval(hours => $4::int))
+            ON CONFLICT DO NOTHING
+            RETURNING id
+            "#,
+        )
+        .bind(&id)
+        .bind(ciphertext)
+        .bind(auto_destroy)
+        .bind(ttl_hours as i32)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(db_error)?;
+
+        if let Some(id) = inserted {
+            return Ok(id);
+        }
+    }
+
+    Err(AppError::new(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "failed to generate a unique secret id",
+    ))
+}
+
+async fn read_secret_content(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> AppResult<(StatusCode, HeaderMap, Json<SecretContentResponse>)> {
+    let row = sqlx::query(
+        r#"
+        DELETE FROM secrets
+        WHERE id = $1 AND expires_at > now() AND auto_destroy = true
+        RETURNING ciphertext, auto_destroy, extract(epoch from created_at)::bigint AS created_at_unix, extract(epoch from expires_at)::bigint AS expires_at_unix
+        "#,
+    )
+    .bind(&id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(db_error)?;
+
+    let row = match row {
+        Some(row) => row,
+        None => sqlx::query(
+            r#"
+            SELECT ciphertext, auto_destroy, extract(epoch from created_at)::bigint AS created_at_unix, extract(epoch from expires_at)::bigint AS expires_at_unix
+            FROM secrets
+            WHERE id = $1 AND expires_at > now() AND auto_destroy = false
+            "#,
+        )
+        .bind(&id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| AppError::new(StatusCode::GONE, "secret has already been read or has expired"))?,
+    };
+
+    record_stat_soon(&state, StatKind::Secret, None);
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+    Ok((
+        StatusCode::OK,
+        headers,
+        Json(SecretContentResponse {
+            ciphertext: URL_SAFE_NO_PAD.encode(row.get::<Vec<u8>, _>("ciphertext")),
+            created_at_unix: row.get::<i64, _>("created_at_unix") as u64,
+            expires_at_unix: row.get::<i64, _>("expires_at_unix") as u64,
+            auto_destroy: row.get::<bool, _>("auto_destroy"),
+        }),
+    ))
+}
+
+async fn burn_secret(State(state): State<AppState>, Path(id): Path<String>) -> AppResult<StatusCode> {
+    let deleted = sqlx::query("DELETE FROM secrets WHERE id = $1 RETURNING id")
+        .bind(&id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(db_error)?;
+
+    if deleted.is_none() {
+        return Err(AppError::new(
+            StatusCode::GONE,
+            "secret has already been read or has expired",
+        ));
+    }
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn enqueue_inbox(
@@ -2105,6 +2346,7 @@ async fn load_stats(state: &AppState) -> AppResult<StatsResponse> {
             &hour_buckets,
         )
         .await?,
+        secrets: count_total(&state.db, StatKind::Secret, StatPeriod::Hour, &hour_buckets).await?,
     };
     let last_30_days = StatCounts {
         redirects: count_total(&state.db, StatKind::Redirect, StatPeriod::Day, &day_buckets)
@@ -2114,6 +2356,7 @@ async fn load_stats(state: &AppState) -> AppResult<StatsResponse> {
             .await?,
         aliases: count_total(&state.db, StatKind::Alias, StatPeriod::Day, &day_buckets).await?,
         forwarded: count_total(&state.db, StatKind::Forward, StatPeriod::Day, &day_buckets).await?,
+        secrets: count_total(&state.db, StatKind::Secret, StatPeriod::Day, &day_buckets).await?,
     };
 
     let hourly = stat_buckets(&state.db, hour_buckets, 3600, StatPeriod::Hour).await?;
@@ -2139,6 +2382,7 @@ async fn stat_buckets(
     let messages = count_series(db, StatKind::Message, period, &buckets).await?;
     let aliases = count_series(db, StatKind::Alias, period, &buckets).await?;
     let forwarded = count_series(db, StatKind::Forward, period, &buckets).await?;
+    let secrets = count_series(db, StatKind::Secret, period, &buckets).await?;
 
     Ok(buckets
         .into_iter()
@@ -2149,6 +2393,7 @@ async fn stat_buckets(
             inboxed_messages: *messages.get(&bucket).unwrap_or(&0),
             aliases: *aliases.get(&bucket).unwrap_or(&0),
             forwarded: *forwarded.get(&bucket).unwrap_or(&0),
+            secrets: *secrets.get(&bucket).unwrap_or(&0),
         })
         .collect())
 }
@@ -2296,6 +2541,26 @@ async fn inbox_notification_worker(database_url: String, inbox_tx: broadcast::Se
     }
 }
 
+async fn secret_cleanup_worker(db: PgPool, interval_seconds: u64) {
+    let mut interval = tokio::time::interval(Duration::from_secs(interval_seconds));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        match sqlx::query("DELETE FROM secrets WHERE expires_at <= now()")
+            .execute(&db)
+            .await
+        {
+            Ok(result) => {
+                let rows = result.rows_affected();
+                if rows > 0 {
+                    info!(rows, "expired secrets cleaned up");
+                }
+            }
+            Err(err) => error!(%err, "secret cleanup failed"),
+        }
+    }
+}
+
 async fn stats_worker(db: PgPool, mut rx: mpsc::Receiver<StatEvent>) {
     let mut batch = Vec::with_capacity(STATS_BATCH_MAX);
     while let Some(event) = rx.recv().await {
@@ -2328,6 +2593,7 @@ async fn record_stat_batch(db: &PgPool, batch: &[StatEvent]) -> AppResult<()> {
             StatKind::Message,
             StatKind::Alias,
             StatKind::Forward,
+            StatKind::Secret,
         ] {
             let count = batch.iter().filter(|event| event.kind == kind).count();
             if count > 0 {
@@ -3147,6 +3413,28 @@ fn random_alias_id() -> AppResult<String> {
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
+fn random_secret_id() -> AppResult<String> {
+    let mut bytes = [0u8; SECRET_ID_BYTES];
+    OsRng
+        .unwrap_err()
+        .try_fill_bytes(&mut bytes)
+        .map_err(|_| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "randomness failed"))?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn decode_secret_ciphertext(config: &Config, ciphertext: &str) -> AppResult<Vec<u8>> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(ciphertext)
+        .map_err(|_| AppError::new(StatusCode::BAD_REQUEST, "ciphertext is not valid base64url"))?;
+    if bytes.len() < SECRET_NONCE_BYTES + 16 {
+        return Err(AppError::new(StatusCode::BAD_REQUEST, "ciphertext is too short"));
+    }
+    if bytes.len() > config.secret_max_bytes {
+        return Err(AppError::new(StatusCode::PAYLOAD_TOO_LARGE, "ciphertext is too large"));
+    }
+    Ok(bytes)
+}
+
 fn current_unix_seconds() -> AppResult<u64> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3244,6 +3532,7 @@ enum StatKind {
     Message,
     Alias,
     Forward,
+    Secret,
 }
 
 impl StatKind {
@@ -3254,6 +3543,7 @@ impl StatKind {
             Self::Message => "m",
             Self::Alias => "a",
             Self::Forward => "f",
+            Self::Secret => "s",
         }
     }
 }
@@ -3379,10 +3669,13 @@ impl Config {
         let max_get_limit = env_usize("INBOX_MAX_GET_LIMIT", 1000).max(1);
         let default_get_limit = env_usize("INBOX_DEFAULT_GET_LIMIT", 1).clamp(1, max_get_limit);
         let library_max_count = env_usize("LIBRARY_MAX_COUNT", 1000) as i64;
+        let secret_max_ttl_hours = env_u64("SECRET_MAX_TTL_HOURS", SECRET_MAX_TTL_HOURS).max(1);
+        let secret_default_ttl_hours = env_u64("SECRET_DEFAULT_TTL_HOURS", SECRET_DEFAULT_TTL_HOURS)
+            .clamp(1, secret_max_ttl_hours);
 
         Ok(Self {
             bind_addr: env::var("BIND_ADDR")
-                .unwrap_or_else(|_| "127.0.0.1:3000".to_owned())
+                .unwrap_or_else(|_| "0.0.0.0:3000".to_owned())
                 .parse()?,
             database_url: env::var("DATABASE_URL")
                 .unwrap_or_else(|_| "postgres://127.0.0.1:5432/postgres".to_owned()),
@@ -3393,6 +3686,10 @@ impl Config {
             library_max_count,
             library_max_ttl_seconds: env_f64("LIBRARY_MAX_TTL_SECONDS", 86_400.0).max(1.0),
             library_max_wait_seconds: env_f64("LIBRARY_MAX_WAIT_SECONDS", 300.0).max(0.0),
+            secret_default_ttl_hours,
+            secret_max_ttl_hours,
+            secret_max_bytes: env_usize("SECRET_MAX_BYTES", SECRET_MAX_BYTES).max(1024),
+            secret_cleanup_interval_seconds: env_u64("SECRET_CLEANUP_INTERVAL_SECONDS", SECRET_CLEANUP_INTERVAL_SECONDS).max(1),
         })
     }
 }
@@ -3424,6 +3721,13 @@ impl IntoResponse for AppError {
 }
 
 fn env_usize(name: &str, default: usize) -> usize {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
     env::var(name)
         .ok()
         .and_then(|value| value.parse().ok())
@@ -3978,6 +4282,58 @@ mod tests {
         assert_eq!(estimate_unique_bits(&bits), 3);
     }
 
+    #[test]
+    fn secret_ciphertext_accepts_valid_nonce_and_box() {
+        let config = test_secret_config();
+        let mut bytes = vec![0u8; SECRET_NONCE_BYTES + 16];
+        bytes[SECRET_NONCE_BYTES] = 1;
+        let encoded = URL_SAFE_NO_PAD.encode(&bytes);
+        assert!(decode_secret_ciphertext(&config, &encoded).is_ok());
+    }
+
+    #[test]
+    fn secret_ciphertext_rejects_invalid_base64() {
+        let config = test_secret_config();
+        let err = decode_secret_ciphertext(&config, "not-valid-base64!!!").unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn secret_ciphertext_rejects_too_short() {
+        let config = test_secret_config();
+        let encoded = URL_SAFE_NO_PAD.encode(vec![0u8; SECRET_NONCE_BYTES]);
+        let err = decode_secret_ciphertext(&config, &encoded).unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn secret_ciphertext_rejects_too_large() {
+        let config = test_secret_config();
+        let mut bytes = vec![0u8; config.secret_max_bytes + 1];
+        bytes[SECRET_NONCE_BYTES] = 1;
+        let encoded = URL_SAFE_NO_PAD.encode(bytes);
+        let err = decode_secret_ciphertext(&config, &encoded).unwrap_err();
+        assert_eq!(err.status, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    fn test_secret_config() -> Config {
+        Config {
+            bind_addr: "127.0.0.1:3000".parse().unwrap(),
+            database_url: String::new(),
+            max_requests: 100,
+            default_get_limit: 1,
+            max_get_limit: 1000,
+            long_poll_seconds: 25.0,
+            library_max_count: 100,
+            library_max_ttl_seconds: 60.0,
+            library_max_wait_seconds: 5.0,
+            secret_default_ttl_hours: 24,
+            secret_max_ttl_hours: 168,
+            secret_max_bytes: 262144,
+            secret_cleanup_interval_seconds: 60,
+        }
+    }
+
     // ------------------------------------------------------------------
     // Library tests
     // ------------------------------------------------------------------
@@ -4008,6 +4364,10 @@ mod tests {
             library_max_count: 100,
             library_max_ttl_seconds: 60.0,
             library_max_wait_seconds: 5.0,
+            secret_default_ttl_hours: 24,
+            secret_max_ttl_hours: 168,
+            secret_max_bytes: 262144,
+            secret_cleanup_interval_seconds: 60,
         };
 
         let router = Router::new()

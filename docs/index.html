@@ -3,8 +3,11 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>cc.me — email aliases</title>
-    <meta name="description" content="Create @cc.me email addresses that forward to your inbox." />
+    <title>cc.me</title>
+    <meta
+      name="description"
+      content="Email aliases, OAuth callbacks, encrypted webhook inboxes, one-time secrets, and distributed semaphores."
+    />
     <meta name="color-scheme" content="light dark" />
     <meta name="go-import" content="cc.me git https://github.com/xmit-co/cc.me" />
     <meta
@@ -22,27 +25,25 @@
       <div class="cols">
         <section>
           <h2>Email aliases</h2>
-          <p>
-            <code>@cc.me</code> addresses that forward to your inbox. Quick &amp; easy.
-          </p>
-          <p><a href="/hi">Create and manage your aliases →</a></p>
+          <p><code>@cc.me</code> addresses that forward to your inbox.</p>
+          <p><a href="/hi">Create and manage aliases →</a></p>
         </section>
 
         <section>
           <h2>HTTP</h2>
-          <p>
-            OAuth callback trampolines and sealed webhook inboxes, with client libraries for
-            JavaScript, Python, Go, Rust, and Ruby.
-          </p>
+          <p>OAuth callback trampolines, sealed webhook inboxes, and client libraries for JS, Python, Go, Rust, and Ruby.</p>
           <p><a href="/http">Read the HTTP docs →</a></p>
         </section>
 
         <section>
+          <h2>One-time secrets</h2>
+          <p>Encrypt a note in your browser, share the link, and it deletes itself after reading.</p>
+          <p><a href="/p">Share a secret →</a></p>
+        </section>
+
+        <section>
           <h2>Library</h2>
-          <p>
-            A distributed semaphore: register a pool of numbered slots under a secret UUID, then
-            borrow leases that auto-expire and return them early.
-          </p>
+          <p>Distributed semaphore: borrow numbered slots with auto-expiring leases.</p>
           <p><a href="/lib">Read the Library docs →</a></p>
         </section>
       </div>
@@ -71,6 +72,10 @@
             <canvas id="h-forwarded"></canvas>
           </article>
           <article>
+            <h3>Secrets, 48h</h3>
+            <canvas id="h-secrets"></canvas>
+          </article>
+          <article>
             <h3>Redirects, 30d</h3>
             <canvas id="d-redirects"></canvas>
           </article>
@@ -89,6 +94,10 @@
           <article>
             <h3>Forwarded, 30d</h3>
             <canvas id="d-forwarded"></canvas>
+          </article>
+          <article>
+            <h3>Secrets, 30d</h3>
+            <canvas id="d-secrets"></canvas>
           </article>
         </div>
       </section>
@@ -154,7 +163,14 @@
         canvas.addEventListener("mouseleave", () => paint());
       }
       const draw = (prefix, data, totals) => {
-        for (const key of ["redirects", "inboxes", "inboxed_messages", "aliases", "forwarded"]) {
+        for (const key of [
+          "redirects",
+          "inboxes",
+          "inboxed_messages",
+          "aliases",
+          "forwarded",
+          "secrets",
+        ]) {
           drawSparkline(
             `${prefix}-${key}`,
             data.map((bucket) => bucket[key]),

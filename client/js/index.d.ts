@@ -88,6 +88,26 @@ export function privateKey(file?: string | URL): Promise<string>;
 export function trampolineUrl(target: string | URL, options?: UrlOptions): string;
 export function createAlias(target: string | URL, options?: FetchOptions): Promise<AliasResponse>;
 
+interface CreateSecretOptions extends FetchOptions {
+  expiresHours?: number;
+  autoDestroy?: boolean;
+}
+
+interface CreateSecretResponse {
+  id: string;
+  url: string;
+}
+
+interface ReadSecretOptions extends FetchOptions {
+  key?: string | Uint8Array;
+}
+
+interface BurnSecretOptions extends FetchOptions {}
+
+export function createSecret(plaintext: string, options?: CreateSecretOptions): Promise<CreateSecretResponse>;
+export function readSecret(urlOrId: string | URL, options?: ReadSecretOptions): Promise<string>;
+export function burnSecret(urlOrId: string | URL, options?: BurnSecretOptions): Promise<void>;
+
 export class CcMeClient {
   constructor(options: ClientOptions);
   inboxUrl(options?: InboxUrlOptions): Promise<string>;

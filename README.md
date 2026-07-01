@@ -32,7 +32,7 @@ deliveries are not removed.
 process-compose up
 ```
 
-That starts Postgres and the app. The service listens on `127.0.0.1:3000` by
+That starts Postgres and the app. The service listens on `0.0.0.0:3000` by
 default.
 
 To run the packaged service binary directly:

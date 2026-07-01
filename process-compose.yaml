@@ -6,14 +6,14 @@ environment:
   - PGPORT=55432
   - PGDATABASE=cc_me
   - PGUSER=cc_me
-  - BIND_ADDR=127.0.0.1:3000
-  # DATABASE_URL comes from .envrc (direnv), inherited here.
+  - DATABASE_URL=postgres://cc_me@127.0.0.1:55432/cc_me
+  - BIND_ADDR=0.0.0.0:3000
 
 processes:
   postgres-init:
     command: |
       set -eu
-      mkdir -p .pgdata
+      mkdir -p .pgdata .pgsock
       if [ ! -s .pgdata/PG_VERSION ]; then
         initdb -D .pgdata --username=cc_me --auth=trust --no-locale --encoding=UTF8 --no-sync
       fi
@@ -23,7 +23,7 @@ processes:
   postgres:
     command: |
       set -eu
-      exec postgres -D .pgdata -p 55432 -h 127.0.0.1 -k "$PWD/.pgdata"
+      exec postgres -D .pgdata -p 55432 -h 127.0.0.1 -k "$PWD/.pgsock"
     shutdown:
       signal: 2
       timeout_seconds: 10
@@ -39,7 +39,7 @@ processes:
   db:
     command: |
       set -eu
-      createdb -h 127.0.0.1 -p 55432 -U cc_me cc_me 2>/dev/null || true
+      createdb -h "$PWD/.pgsock" -p 55432 -U cc_me cc_me 2>/dev/null || true
     depends_on:
       postgres:
         condition: process_healthy

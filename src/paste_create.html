@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>cc.me — share a secret</title>
+<style nonce="{{nonce}}">
+  :root { --bg: #0d1117; --fg: #c9d1d9; --accent: #58a6ff; --error: #f85149; --ok: #3fb950; }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: var(--bg); color: var(--fg); max-width: 720px; margin: 0 auto; padding: 2rem 1rem; line-height: 1.5; }
+  h1 { font-weight: 600; margin-bottom: 0.25rem; }
+  p.subtitle { color: #8b949e; margin-top: 0; }
+  label { display: block; margin: 1rem 0 0.25rem; font-weight: 500; }
+  textarea { width: 100%; min-height: 180px; padding: 0.75rem; border: 1px solid #30363d; border-radius: 6px; background: #161b22; color: var(--fg); font-family: ui-monospace, monospace; font-size: inherit; resize: vertical; }
+  textarea:focus { outline: none; border-color: var(--accent); }
+  select, button { font: inherit; padding: 0.5rem 0.75rem; border-radius: 6px; border: 1px solid #30363d; background: #161b22; color: var(--fg); }
+  button { background: var(--accent); color: #fff; border-color: var(--accent); cursor: pointer; font-weight: 600; }
+  button:disabled { opacity: 0.6; cursor: not-allowed; }
+  .row { display: flex; gap: 1rem; align-items: center; flex-wrap: wrap; margin-top: 1rem; }
+  .result { margin-top: 1.5rem; padding: 1rem; border: 1px solid #30363d; border-radius: 6px; background: #161b22; display: none; }
+  .result.visible { display: block; }
+  .result input { width: 100%; padding: 0.5rem; font: inherit; background: #0d1117; color: var(--fg); border: 1px solid #30363d; border-radius: 4px; }
+  .error { color: var(--error); margin-top: 0.5rem; }
+  .warning { color: #d29922; font-size: 0.9rem; margin-top: 0.5rem; }
+  .note { font-size: 0.85rem; color: #8b949e; margin-top: 1rem; }
+</style>
+</head>
+<body>
+  <h1>Share a secret</h1>
+  <p class="subtitle">One-time, encrypted in your browser. The server never sees the plaintext.</p>
+
+  <label for="secret">Secret</label>
+  <textarea id="secret" placeholder="Paste a password, config snippet, private note…"></textarea>
+
+  <label for="ttl">Expires in</label>
+  <select id="ttl">
+    <option value="1">1 hour</option>
+    <option value="6">6 hours</option>
+    <option value="24" selected>24 hours</option>
+    <option value="72">3 days</option>
+    <option value="168">7 days</option>
+  </select>
+
+  <label class="row" style="justify-content: flex-start; margin-top: 1rem;">
+    <input id="auto-destroy" type="checkbox" checked>
+    <span>Destroy after first read</span>
+  </label>
+
+  <div class="row">
+    <button id="create">Create secret link</button>
+  </div>
+
+  <div id="error" class="error"></div>
+
+  <div id="result" class="result">
+    <label for="url">Secret URL</label>
+    <input id="url" type="text" readonly>
+    <p id="result-warning" class="warning">This link can only be opened once. Copy it now — it cannot be recovered.</p>
+  </div>
+
+  <p class="note">The decryption key is in the part of the URL after <code>#</code> and is never sent to the server.</p>
+
+<script src="/tweetnacl.js" nonce="{{nonce}}"></script>
+<script nonce="{{nonce}}">
+  const $ = id => document.getElementById(id);
+  const encoder = new TextEncoder();
+
+  function bytesToBase64Url(bytes) {
+    let binary = "";
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+    }
+    return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+  }
+
+  async function createSecret() {
+    const plaintext = $("secret").value;
+    if (!plaintext) return;
+
+    $("create").disabled = true;
+    $("error").textContent = "";
+
+    try {
+      const key = nacl.randomBytes(32);
+      const nonce = nacl.randomBytes(24);
+      const box = nacl.secretbox(encoder.encode(plaintext), nonce, key);
+      if (!box) throw new Error("encryption failed");
+
+      const payload = new Uint8Array(nonce.length + box.length);
+      payload.set(nonce);
+      payload.set(box, nonce.length);
+      const ciphertext = bytesToBase64Url(payload);
+
+      const ttl = parseInt($("ttl").value, 10);
+      const autoDestroy = $("auto-destroy").checked;
+      const response = await fetch("/p", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ciphertext, expires_hours: ttl, auto_destroy: autoDestroy }),
+      });
+
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.error || `HTTP ${response.status}`);
+      }
+
+      const { id } = await response.json();
+      const url = `${location.origin}/p/${id}#${bytesToBase64Url(key)}`;
+      $("url").value = url;
+      $("result-warning").textContent = autoDestroy
+        ? "This link can only be opened once. Copy it now — it cannot be recovered."
+        : "This link can be opened multiple times until it expires. Copy it now — it cannot be recovered.";
+      $("result").classList.add("visible");
+      $("secret").value = "";
+    } catch (err) {
+      $("error").textContent = err.message || "failed to create secret";
+      $("result").classList.remove("visible");
+    } finally {
+      $("create").disabled = false;
+    }
+  }
+
+  $("create").addEventListener("click", createSecret);
+  $("secret").addEventListener("input", () => {
+    $("result").classList.remove("visible");
+    $("error").textContent = "";
+  });
+</script>
+</body>
+</html>

@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { CcMeClient, privateKey } from "./index.js";
+import { CcMeClient, burnSecret, createSecret, privateKey, readSecret } from "./index.js";
 
 const DEFAULT_KEY_FILE = join(homedir(), ".cc-me.key");
 const DEFAULT_LIMIT = 10;
@@ -15,7 +15,10 @@ const JSON_BODY_LIMIT = 1024 * 1024;
 export function usage() {
   return `usage:
   cc-me [--key <path>] <forward-url>
-  cc-me inspect [--key <path>] [--port <port>]`;
+  cc-me inspect [--key <path>] [--port <port>]
+  cc-me paste [--expires-hours <n>] [--no-auto-destroy]
+  cc-me read <secret-url>
+  cc-me burn <secret-url>`;
 }
 
 export function parseArgs(args) {
@@ -24,6 +27,8 @@ export function parseArgs(args) {
     keyFile: process.env.CC_ME_KEY ?? DEFAULT_KEY_FILE,
     port: Number(process.env.CC_ME_INSPECT_PORT ?? DEFAULT_INSPECT_PORT),
     target: undefined,
+    expiresHours: undefined,
+    autoDestroy: true,
   };
   const positionals = [];
 
@@ -32,7 +37,11 @@ export function parseArgs(args) {
     if (arg === "--help" || arg === "-h") {
       return { command: "help" };
     }
-    if (arg === "--key" || arg === "--port") {
+    if (arg === "--no-auto-destroy") {
+      options.autoDestroy = false;
+      continue;
+    }
+    if (arg === "--key" || arg === "--port" || arg === "--expires-hours") {
       i += 1;
       if (!args[i]) {
         throw new Error(`${arg} needs a value`);
@@ -40,7 +49,7 @@ export function parseArgs(args) {
       setOption(options, arg, args[i]);
       continue;
     }
-    if (arg.startsWith("--key=") || arg.startsWith("--port=")) {
+    if (arg.startsWith("--key=") || arg.startsWith("--port=") || arg.startsWith("--expires-hours=")) {
       const [name, value] = arg.split("=", 2);
       if (!value) {
         throw new Error(`${name} needs a value`);
@@ -57,8 +66,19 @@ export function parseArgs(args) {
   if (positionals[0] === "inspect") {
     options.command = "inspect";
     if (positionals.length > 1) {
-      throw new Error("inspect does not take a forward URL");
+      throw new Error("inspect does not take arguments");
     }
+  } else if (positionals[0] === "paste") {
+    options.command = "paste";
+    if (positionals.length > 1) {
+      throw new Error("paste does not take positional arguments");
+    }
+  } else if (positionals[0] === "read" || positionals[0] === "burn") {
+    options.command = positionals[0];
+    if (positionals.length !== 2) {
+      throw new Error(`${options.command} requires a secret URL`);
+    }
+    options.target = positionals[1];
   } else {
     if (positionals.length > 1) {
       throw new Error("only one forward URL is supported");
@@ -80,6 +100,10 @@ function setOption(options, name, value) {
   }
   if (name === "--port") {
     options.port = Number(value);
+    return;
+  }
+  if (name === "--expires-hours") {
+    options.expiresHours = Number(value);
   }
 }
 
@@ -523,12 +547,54 @@ fetch("/api/status").then((response) => response.json()).then((data) => {
 </html>`;
 }
 
+async function readStdin() {
+  const chunks = [];
+  for await (const chunk of process.stdin) {
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+async function pasteSecret(options) {
+  const plaintext = await readStdin();
+  if (!plaintext) {
+    throw new Error("paste requires secret text on stdin");
+  }
+  const result = await createSecret(plaintext, {
+    baseUrl: process.env.CC_ME_URL,
+    expiresHours: options.expiresHours,
+    autoDestroy: options.autoDestroy,
+  });
+  console.log(result.url);
+}
+
+async function readSecretCommand(options) {
+  const plaintext = await readSecret(options.target, {
+    baseUrl: process.env.CC_ME_URL,
+  });
+  process.stdout.write(plaintext);
+  if (!plaintext.endsWith("\n")) {
+    process.stdout.write("\n");
+  }
+}
+
+async function burnSecretCommand(options) {
+  await burnSecret(options.target, { baseUrl: process.env.CC_ME_URL });
+  console.error("secret burned");
+}
+
 async function main() {
   const options = parseArgs(process.argv.slice(2));
   if (options.command === "help") {
     console.log(usage());
   } else if (options.command === "inspect") {
     await startInspector(options);
+  } else if (options.command === "paste") {
+    await pasteSecret(options);
+  } else if (options.command === "read") {
+    await readSecretCommand(options);
+  } else if (options.command === "burn") {
+    await burnSecretCommand(options);
   } else {
     await forwardLoop(options);
   }
