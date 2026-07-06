@@ -1,9 +1,9 @@
 use std::{
     collections::{HashMap, HashSet},
     env,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr, ToSocketAddrs},
     sync::{
-        LazyLock,
+        Arc, LazyLock,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -88,6 +88,16 @@ const SECRET_MAX_BYTES: usize = 256 * 1024;
 const SECRET_MAX_REQUEST_BYTES: usize = 512 * 1024;
 const SECRET_CLEANUP_INTERVAL_SECONDS: u64 = 60;
 const SECRET_CSP_NONCE_BYTES: usize = 16;
+const DOCS_ICON_HTML: &str = include_str!("../docs/icon.html");
+const ICON_MAX_BYTES: usize = 256 * 1024;
+const ICON_MAX_HTML_BYTES: usize = 512 * 1024;
+const ICON_CACHE_OK_TTL_SECONDS: i64 = 7 * 24 * 3600;
+const ICON_CACHE_ERR_TTL_SECONDS: i64 = 3600;
+const ICON_CONNECT_TIMEOUT_SECONDS: u64 = 4;
+const ICON_FETCH_TIMEOUT_SECONDS: u64 = 8;
+const ICON_MAX_REDIRECTS: usize = 5;
+const ICON_USER_AGENT: &str = "cc.me-favicon/1.0 (+https://cc.me/icon)";
+const MIGRATE_ADVISORY_LOCK: i64 = 0x6363_6d65; // "ccme"
 
 static EVENT_COUNTER: AtomicU64 = AtomicU64::new(0);
 static EVENT_PREFIX: LazyLock<String> = LazyLock::new(|| {
@@ -105,6 +115,7 @@ struct AppState {
     inbox_tx: broadcast::Sender<String>,
     library_tx: broadcast::Sender<String>,
     stats_tx: mpsc::Sender<StatEvent>,
+    http: reqwest::Client,
     config: Config,
 }
 
@@ -430,10 +441,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.secret_cleanup_interval_seconds,
     ));
 
+    let http = build_http_client();
+
     let app = Router::new()
         .route("/", get(root))
         .route("/http", get(http_docs))
         .route("/lib", get(library_docs))
+        .route("/icon", get(icon))
         .route(
             "/l/{id}",
             put(put_resource).get(get_resource).delete(delete_resource),
@@ -486,6 +500,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             inbox_tx,
             library_tx,
             stats_tx,
+            http,
             config: config.clone(),
         });
 
@@ -527,7 +542,26 @@ async fn shutdown_signal() {
     }
 }
 
+// Serialize schema setup with a session-scoped advisory lock: Postgres
+// `CREATE ... IF NOT EXISTS` is not race-safe, so concurrent callers (multiple
+// app instances, or parallel tests) could otherwise fail with duplicate-object
+// errors. The lock is held on a dedicated connection for the whole run and
+// released when it returns.
 async fn migrate(db: &PgPool) -> Result<(), sqlx::Error> {
+    let mut lock = db.acquire().await?;
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(MIGRATE_ADVISORY_LOCK)
+        .execute(&mut *lock)
+        .await?;
+    let result = run_migrations(db).await;
+    let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(MIGRATE_ADVISORY_LOCK)
+        .execute(&mut *lock)
+        .await;
+    result
+}
+
+async fn run_migrations(db: &PgPool) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS aliases (
@@ -855,6 +889,20 @@ async fn migrate(db: &PgPool) -> Result<(), sqlx::Error> {
     .execute(db)
     .await?;
 
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS favicon_cache (
+            origin       text PRIMARY KEY,
+            content_type text,
+            bytes        bytea,
+            ok           boolean NOT NULL,
+            fetched_at   timestamptz NOT NULL DEFAULT now()
+        )
+        "#,
+    )
+    .execute(db)
+    .await?;
+
     Ok(())
 }
 
@@ -900,6 +948,353 @@ async fn http_docs() -> Response {
 
 async fn library_docs() -> Response {
     docs_html(DOCS_LIB_HTML)
+}
+
+// Favicon proxy. `GET /icon?url=<url>` returns the site's favicon bytes with a
+// permissive CORS header (set by the global layer) so any page — e.g. found.as —
+// can embed `<img src="https://cc.me/icon?url=https://example.com">`. With no
+// `url` it serves the docs page. Missing favicons return 404, never a placeholder.
+async fn icon(State(state): State<AppState>, RawQuery(raw_query): RawQuery) -> AppResult<Response> {
+    let url = raw_query.as_deref().and_then(|query| {
+        form_urlencoded::parse(query.as_bytes())
+            .find(|(key, _)| key == "url")
+            .map(|(_, value)| value.into_owned())
+    });
+    let Some(url) = url else {
+        return Ok(docs_html(DOCS_ICON_HTML));
+    };
+
+    let origin = origin_of(&url)?;
+
+    if let Some(hit) = favicon_cache_lookup(&state, &origin).await? {
+        return match hit {
+            Some((content_type, bytes)) => Ok(icon_image_response(&content_type, bytes)),
+            None => Err(icon_not_found()),
+        };
+    }
+
+    match fetch_favicon(&state.http, &origin).await {
+        Some((content_type, bytes)) => {
+            favicon_cache_store(&state, &origin, Some((&content_type, &bytes))).await?;
+            Ok(icon_image_response(&content_type, bytes))
+        }
+        None => {
+            favicon_cache_store(&state, &origin, None).await?;
+            Err(icon_not_found())
+        }
+    }
+}
+
+fn icon_not_found() -> AppError {
+    AppError::new(StatusCode::NOT_FOUND, "favicon not found")
+}
+
+fn icon_image_response(content_type: &str, bytes: Vec<u8>) -> Response {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, content_type.to_owned()),
+            (
+                header::CACHE_CONTROL,
+                format!("public, max-age={ICON_CACHE_OK_TTL_SECONDS}"),
+            ),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+// Normalize a user URL to its origin ("scheme://host[:port]"), used as the cache
+// key and fetch base. Rejects non-http(s) URLs and literal forbidden IP hosts
+// (defense in depth; the DNS resolver blocks hostnames that resolve to them).
+fn origin_of(input: &str) -> AppResult<String> {
+    let parsed =
+        Url::parse(input).map_err(|_| AppError::new(StatusCode::BAD_REQUEST, "url is invalid"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(AppError::new(
+            StatusCode::BAD_REQUEST,
+            "url must be http or https",
+        ));
+    }
+    // Reject literal-IP hosts pointing at non-public addresses. HTTP clients skip
+    // the DNS resolver for IP literals, so this check (covering both v4 and v6,
+    // brackets and all, via the typed Host) is the only guard for them.
+    let forbidden = match parsed.host() {
+        Some(url::Host::Ipv4(ip)) => ip_is_forbidden(&IpAddr::V4(ip)),
+        Some(url::Host::Ipv6(ip)) => ip_is_forbidden(&IpAddr::V6(ip)),
+        Some(url::Host::Domain(_)) => false,
+        None => return Err(AppError::new(StatusCode::BAD_REQUEST, "url has no host")),
+    };
+    if forbidden {
+        return Err(AppError::new(
+            StatusCode::BAD_REQUEST,
+            "url host is not allowed",
+        ));
+    }
+    // `origin()` gives "scheme://host[:port]" with the host lowercased, IPv6
+    // bracketed, and default ports dropped — a stable cache key and fetch base.
+    Ok(parsed.origin().ascii_serialization())
+}
+
+// Ok(None) = cache miss (fetch); Ok(Some(None)) = fresh negative (return 404);
+// Ok(Some(Some(..))) = fresh hit. Stale rows are treated as a miss.
+async fn favicon_cache_lookup(
+    state: &AppState,
+    origin: &str,
+) -> AppResult<Option<Option<(String, Vec<u8>)>>> {
+    let row = sqlx::query(
+        r#"
+        SELECT content_type,
+               bytes,
+               ok,
+               extract(epoch from (now() - fetched_at))::bigint AS age
+        FROM favicon_cache
+        WHERE origin = $1
+        "#,
+    )
+    .bind(origin)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(db_error)?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let ok: bool = row.get("ok");
+    let age: i64 = row.get("age");
+    let ttl = if ok {
+        ICON_CACHE_OK_TTL_SECONDS
+    } else {
+        ICON_CACHE_ERR_TTL_SECONDS
+    };
+    if age > ttl {
+        return Ok(None);
+    }
+    if !ok {
+        return Ok(Some(None));
+    }
+    let content_type: Option<String> = row.get("content_type");
+    let bytes: Option<Vec<u8>> = row.get("bytes");
+    match (content_type, bytes) {
+        (Some(content_type), Some(bytes)) => Ok(Some(Some((content_type, bytes)))),
+        _ => Ok(None),
+    }
+}
+
+async fn favicon_cache_store(
+    state: &AppState,
+    origin: &str,
+    image: Option<(&str, &[u8])>,
+) -> AppResult<()> {
+    let ok = image.is_some();
+    let content_type = image.map(|(content_type, _)| content_type.to_owned());
+    let bytes = image.map(|(_, bytes)| bytes.to_vec());
+    sqlx::query(
+        r#"
+        INSERT INTO favicon_cache (origin, content_type, bytes, ok, fetched_at)
+        VALUES ($1, $2, $3, $4, now())
+        ON CONFLICT (origin) DO UPDATE
+        SET content_type = EXCLUDED.content_type,
+            bytes = EXCLUDED.bytes,
+            ok = EXCLUDED.ok,
+            fetched_at = now()
+        "#,
+    )
+    .bind(origin)
+    .bind(content_type)
+    .bind(bytes)
+    .bind(ok)
+    .execute(&state.db)
+    .await
+    .map_err(db_error)?;
+    Ok(())
+}
+
+// Discover and fetch the site's favicon: parse the homepage for <link rel="icon">
+// candidates, then fall back to /favicon.ico. Returns the first response whose
+// bytes are a recognizable image.
+async fn fetch_favicon(client: &reqwest::Client, origin: &str) -> Option<(String, Vec<u8>)> {
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(html) = fetch_text(client, origin, ICON_MAX_HTML_BYTES).await {
+        if let Ok(base) = Url::parse(origin) {
+            for href in extract_icon_hrefs(&html) {
+                if let Ok(absolute) = base.join(&href) {
+                    if matches!(absolute.scheme(), "http" | "https") {
+                        candidates.push(absolute.to_string());
+                    }
+                }
+            }
+        }
+    }
+    candidates.push(format!("{origin}/favicon.ico"));
+
+    for candidate in candidates {
+        if let Some(image) = fetch_image(client, &candidate).await {
+            return Some(image);
+        }
+    }
+    None
+}
+
+async fn fetch_text(client: &reqwest::Client, url: &str, cap: usize) -> Option<String> {
+    let bytes = fetch_capped(client, url, cap).await?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+async fn fetch_image(client: &reqwest::Client, url: &str) -> Option<(String, Vec<u8>)> {
+    let response = client.get(url).send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let server_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_ascii_lowercase());
+    let bytes = read_capped(response, ICON_MAX_BYTES).await?;
+    if bytes.is_empty() {
+        return None;
+    }
+    let content_type = match server_type {
+        Some(value) if value.starts_with("image/") => {
+            value.split(';').next().unwrap_or(&value).trim().to_owned()
+        }
+        _ => sniff_image_content_type(&bytes)?.to_owned(),
+    };
+    Some((content_type, bytes))
+}
+
+async fn fetch_capped(client: &reqwest::Client, url: &str, cap: usize) -> Option<Vec<u8>> {
+    let response = client.get(url).send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    read_capped(response, cap).await
+}
+
+// Stream the body, aborting (None) if it exceeds `cap` so a hostile server can't
+// exhaust memory.
+async fn read_capped(mut response: reqwest::Response, cap: usize) -> Option<Vec<u8>> {
+    let mut buffer = Vec::new();
+    while let Some(chunk) = response.chunk().await.ok()? {
+        if buffer.len() + chunk.len() > cap {
+            return None;
+        }
+        buffer.extend_from_slice(&chunk);
+    }
+    Some(buffer)
+}
+
+// Parse the page with a real HTML parser (html5ever, via scraper) and collect the
+// href of every <link> whose rel mentions "icon" — covering "icon",
+// "shortcut icon", and "apple-touch-icon". html5ever tolerates broken markup and
+// decodes entities; /favicon.ico is always tried as a fallback.
+fn extract_icon_hrefs(html: &str) -> Vec<String> {
+    let document = scraper::Html::parse_document(html);
+    let Ok(selector) = scraper::Selector::parse(r#"link[rel*="icon" i]"#) else {
+        return Vec::new();
+    };
+    document
+        .select(&selector)
+        .filter_map(|element| element.value().attr("href"))
+        .map(str::trim)
+        .filter(|href| !href.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn sniff_image_content_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.len() >= 4 && bytes[..4] == [0x00, 0x00, 0x01, 0x00] {
+        return Some("image/x-icon");
+    }
+    if bytes.len() >= 8 && bytes[..8] == [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'] {
+        return Some("image/png");
+    }
+    if bytes.len() >= 3 && &bytes[..3] == b"GIF" {
+        return Some("image/gif");
+    }
+    if bytes.len() >= 3 && bytes[..3] == [0xff, 0xd8, 0xff] {
+        return Some("image/jpeg");
+    }
+    if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    let head = &bytes[..bytes.len().min(512)];
+    if String::from_utf8_lossy(head).to_ascii_lowercase().contains("<svg") {
+        return Some("image/svg+xml");
+    }
+    None
+}
+
+fn build_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .user_agent(ICON_USER_AGENT)
+        .connect_timeout(Duration::from_secs(ICON_CONNECT_TIMEOUT_SECONDS))
+        .timeout(Duration::from_secs(ICON_FETCH_TIMEOUT_SECONDS))
+        .redirect(reqwest::redirect::Policy::limited(ICON_MAX_REDIRECTS))
+        .dns_resolver(Arc::new(SafeResolver))
+        .build()
+        .expect("build http client")
+}
+
+// A reqwest DNS resolver that drops non-global addresses before connecting.
+// Because reqwest connects to exactly the addresses this returns, filtering here
+// closes the DNS-rebinding TOCTOU gap and applies to every redirect hop too.
+struct SafeResolver;
+
+impl reqwest::dns::Resolve for SafeResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        Box::pin(async move {
+            let host = name.as_str().to_owned();
+            let resolved = tokio::task::spawn_blocking(move || {
+                (host.as_str(), 0u16)
+                    .to_socket_addrs()
+                    .map(|addrs| addrs.collect::<Vec<SocketAddr>>())
+            })
+            .await
+            .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?
+            .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
+
+            let allowed: Vec<SocketAddr> = resolved
+                .into_iter()
+                .filter(|addr| !ip_is_forbidden(&addr.ip()))
+                .collect();
+            if allowed.is_empty() {
+                return Err("host resolves only to blocked addresses".into());
+            }
+            Ok(Box::new(allowed.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+// True for addresses we must never fetch from: loopback, private, link-local,
+// CGNAT, multicast/reserved, unspecified, and their IPv6 equivalents.
+fn ip_is_forbidden(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            v4.is_unspecified()
+                || v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || octets[0] == 0
+                || (octets[0] == 100 && (0x40..0x80).contains(&octets[1])) // 100.64.0.0/10 CGNAT
+                || octets[0] >= 224 // multicast + reserved
+        }
+        IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return ip_is_forbidden(&IpAddr::V4(mapped));
+            }
+            let segments = v6.segments();
+            v6.is_unspecified()
+                || v6.is_loopback()
+                || v6.is_multicast()
+                || (segments[0] & 0xfe00) == 0xfc00 // unique local fc00::/7
+                || (segments[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
+        }
+    }
 }
 
 fn parse_uuid(id: &str) -> AppResult<Uuid> {
@@ -4382,6 +4777,7 @@ mod tests {
                 inbox_tx,
                 library_tx,
                 stats_tx,
+                http: build_http_client(),
                 config,
             });
 
@@ -5190,5 +5586,99 @@ mod tests {
 
         drop(router);
         db.close().await;
+    }
+
+    // ------------------------------------------------------------------
+    // Favicon helpers (no DB / network required)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn origin_of_normalizes_and_validates() {
+        assert_eq!(
+            origin_of("https://Example.com/path?q=1#f").unwrap(),
+            "https://example.com"
+        );
+        assert_eq!(
+            origin_of("http://example.com:8080/").unwrap(),
+            "http://example.com:8080"
+        );
+        // Default ports are dropped for a stable cache key.
+        assert_eq!(origin_of("https://example.com:443/").unwrap(), "https://example.com");
+        assert!(origin_of("ftp://example.com").is_err());
+        assert!(origin_of("not a url").is_err());
+        assert!(origin_of("http://127.0.0.1/").is_err());
+        assert!(origin_of("http://[::1]/").is_err());
+    }
+
+    #[test]
+    fn ip_is_forbidden_blocks_non_public() {
+        for blocked in [
+            "0.0.0.0",
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.1.1",
+            "100.64.0.1",
+            "224.0.0.1",
+            "::1",
+            "::",
+            "fc00::1",
+            "fe80::1",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(
+                ip_is_forbidden(&blocked.parse().unwrap()),
+                "{blocked} should be forbidden"
+            );
+        }
+        for allowed in ["1.1.1.1", "93.184.216.34", "2606:2800:220:1::1"] {
+            assert!(
+                !ip_is_forbidden(&allowed.parse().unwrap()),
+                "{allowed} should be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_icon_hrefs_uses_a_real_parser() {
+        let html = r#"
+            <html><head>
+              <link rel="stylesheet" href="/style.css">
+              <link rel="ICON" href="/fav.ico">
+              <link rel="shortcut icon" href="/legacy.ico">
+              <link rel="apple-touch-icon" href="/apple.png?v=2&amp;x=1">
+              <link rel="icon" type="image/svg+xml" href='/icon.svg'>
+              <link rel="canonical" href="/self">
+            </head></html>
+        "#;
+        let hrefs = extract_icon_hrefs(html);
+        assert!(hrefs.contains(&"/fav.ico".to_owned()));
+        assert!(hrefs.contains(&"/legacy.ico".to_owned()));
+        assert!(hrefs.contains(&"/icon.svg".to_owned()));
+        // Entities are decoded by the parser.
+        assert!(hrefs.contains(&"/apple.png?v=2&x=1".to_owned()));
+        // Non-icon links are ignored.
+        assert!(!hrefs.iter().any(|h| h.contains("style.css") || h == "/self"));
+    }
+
+    #[test]
+    fn sniff_image_content_type_recognizes_formats() {
+        assert_eq!(
+            sniff_image_content_type(&[0x00, 0x00, 0x01, 0x00, 0x10]),
+            Some("image/x-icon")
+        );
+        assert_eq!(
+            sniff_image_content_type(b"\x89PNG\r\n\x1a\nrest"),
+            Some("image/png")
+        );
+        assert_eq!(sniff_image_content_type(b"GIF89a"), Some("image/gif"));
+        assert_eq!(sniff_image_content_type(&[0xff, 0xd8, 0xff, 0xe0]), Some("image/jpeg"));
+        assert_eq!(
+            sniff_image_content_type(b"<?xml version=\"1.0\"?><svg xmlns=\"...\">"),
+            Some("image/svg+xml")
+        );
+        // An HTML 404 page served with 200 must not pass as an image.
+        assert_eq!(sniff_image_content_type(b"<!doctype html><title>Not found</title>"), None);
     }
 }

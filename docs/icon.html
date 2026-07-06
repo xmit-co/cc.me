@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>cc.me docs — Favicons</title>
+    <meta
+      name="description"
+      content="Fetch and cache the favicon of any URL, embeddable as an image from any page."
+    />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="go-import" content="cc.me git https://github.com/xmit-co/cc.me" />
+    <meta
+      name="go-source"
+      content="cc.me https://github.com/xmit-co/cc.me https://github.com/xmit-co/cc.me/tree/main{/dir} https://github.com/xmit-co/cc.me/blob/main{/dir}/{file}#L{line}"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header>
+      <span class="brand"><a href="/">cc.me</a> / Favicons</span>
+      <nav aria-label="Sections">
+        <a href="#use">Use</a>
+        <a href="#behavior">Behavior</a>
+        <a href="#errors">Errors</a>
+      </nav>
+    </header>
+
+    <main>
+      <section class="intro">
+        <h1>Favicons.</h1>
+        <p>
+          <code>GET /icon?url=&lt;url&gt;</code> returns the favicon of any site as an image,
+          served with an open CORS policy so any page — a dashboard, a link list,
+          <code>found.as</code> — can embed it directly. Results are cached, and a missing
+          favicon is an honest <code>404</code>, never a placeholder.
+        </p>
+      </section>
+
+      <section id="use">
+        <h2>Use</h2>
+        <p>Embed it as an image. The <code>url</code> value must be URL-encoded.</p>
+        <pre><code class="language-http"><span class="tok-method">GET</span> <span class="tok-path">/icon</span><span class="tok-query">?url=https%3A%2F%2Fexample.com</span></code></pre>
+        <pre><code class="language-html">&lt;<span class="tok-kw">img</span> <span class="tok-prop">src</span>=<span class="tok-str">"https://cc.me/icon?url=https%3A%2F%2Fexample.com"</span>
+     <span class="tok-prop">width</span>=<span class="tok-str">"16"</span> <span class="tok-prop">height</span>=<span class="tok-str">"16"</span> <span class="tok-prop">alt</span>=<span class="tok-str">""</span>&gt;</code></pre>
+        <p>
+          The response is the raw image (<code>image/x-icon</code>, <code>image/png</code>,
+          <code>image/svg+xml</code>, …) with
+          <code>Cache-Control: public, max-age=604800</code>. Handle misses on the client:
+        </p>
+        <pre><code class="language-html">&lt;<span class="tok-kw">img</span> <span class="tok-prop">src</span>=<span class="tok-str">"https://cc.me/icon?url=https%3A%2F%2Fexample.com"</span>
+     <span class="tok-prop">onerror</span>=<span class="tok-str">"this.replaceWith(myFallback())"</span>&gt;</code></pre>
+      </section>
+
+      <section id="behavior">
+        <h2>Behavior</h2>
+        <ul>
+          <li>
+            Discovery parses the page for <code>&lt;link rel="icon"&gt;</code> (and
+            <code>apple-touch-icon</code>, <code>shortcut icon</code>) and falls back to
+            <code>/favicon.ico</code>. The first response whose bytes are a real image wins.
+          </li>
+          <li>
+            The favicon is looked up per <strong>origin</strong> (scheme + host + port), so
+            <code>https://example.com/a</code> and <code>https://example.com/b</code> share a
+            result.
+          </li>
+          <li>
+            Results are cached: hits for a week, misses for an hour, so repeated embeds don't
+            re-fetch the target.
+          </li>
+          <li>
+            Only <code>http</code> and <code>https</code> URLs are accepted, and requests to
+            private, loopback, link-local, or other non-public addresses are refused — including
+            across redirects.
+          </li>
+          <li>Responses are capped in size and time; oversized or slow targets yield a miss.</li>
+        </ul>
+      </section>
+
+      <section id="errors">
+        <h2>Errors</h2>
+        <dl>
+          <dt><code>400</code></dt>
+          <dd>
+            Missing or malformed <code>url</code>, a non-<code>http(s)</code> scheme, or a host
+            that is a disallowed literal IP.
+          </dd>
+          <dt><code>404</code></dt>
+          <dd>No favicon could be found for the origin. Substitute your own icon client-side.</dd>
+          <dt><code>502</code></dt>
+          <dd>The cache lookup failed. Safe to retry.</dd>
+        </dl>
+      </section>
+
+      <footer>
+        By <a href="https://xmit.dev/">xmit dev team</a>. We fetch only public sites and cache
+        just their favicons.
+      </footer>
+    </main>
+  </body>
+</html>
