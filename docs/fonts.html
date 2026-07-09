@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>cc.me docs — Fonts</title>
+    <meta
+      name="description"
+      content="Search the Google Fonts catalog and download font files over a simple HTTP API."
+    />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="go-import" content="cc.me git https://github.com/xmit-co/cc.me" />
+    <meta
+      name="go-source"
+      content="cc.me https://github.com/xmit-co/cc.me https://github.com/xmit-co/cc.me/tree/main{/dir} https://github.com/xmit-co/cc.me/blob/main{/dir}/{file}#L{line}"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header>
+      <span class="brand"><a href="/">cc.me</a> / Fonts</span>
+      <nav aria-label="Sections">
+        <a href="#search">Search</a>
+        <a href="#family">Family</a>
+        <a href="#download">Download</a>
+        <a href="#errors">Errors</a>
+      </nav>
+    </header>
+
+    <main>
+      <section class="intro">
+        <h1>Fonts.</h1>
+        <p>
+          Search the <a href="https://github.com/google/fonts">Google Fonts</a> catalog and
+          download font files. cc.me indexes a local clone of the repository and serves it over a
+          small JSON API with an open CORS policy, so any page can look up families and fetch
+          <code>.ttf</code> files directly.
+        </p>
+      </section>
+
+      <section id="search">
+        <h2>Search</h2>
+        <p>
+          <code>GET /fonts</code> with a query returns matching families. All parameters are
+          optional: <code>q</code> matches the family name or slug, <code>category</code> and
+          <code>subset</code> filter, and <code>limit</code> (max 100) / <code>offset</code>
+          paginate. An empty query lists everything.
+        </p>
+        <pre><code class="language-http"><span class="tok-method">GET</span> <span class="tok-path">/fonts</span><span class="tok-query">?q=roboto&amp;category=SANS_SERIF&amp;subset=latin&amp;limit=2</span></code></pre>
+        <pre><code class="language-json">{
+  <span class="tok-str">"total"</span>: <span class="tok-num">18</span>,
+  <span class="tok-str">"count"</span>: <span class="tok-num">2</span>,
+  <span class="tok-str">"offset"</span>: <span class="tok-num">0</span>,
+  <span class="tok-str">"limit"</span>: <span class="tok-num">2</span>,
+  <span class="tok-str">"families"</span>: [
+    {
+      <span class="tok-str">"slug"</span>: <span class="tok-str">"roboto"</span>,
+      <span class="tok-str">"name"</span>: <span class="tok-str">"Roboto"</span>,
+      <span class="tok-str">"license"</span>: <span class="tok-str">"apache"</span>,
+      <span class="tok-str">"category"</span>: <span class="tok-str">"SANS_SERIF"</span>,
+      <span class="tok-str">"designer"</span>: <span class="tok-str">"Christian Robertson"</span>,
+      <span class="tok-str">"subsets"</span>: [<span class="tok-str">"latin"</span>, <span class="tok-str">"cyrillic"</span>],
+      <span class="tok-str">"variable"</span>: <span class="tok-bool">true</span>,
+      <span class="tok-str">"files"</span>: [
+        {
+          <span class="tok-str">"filename"</span>: <span class="tok-str">"Roboto[wdth,wght].ttf"</span>,
+          <span class="tok-str">"style"</span>: <span class="tok-str">"normal"</span>,
+          <span class="tok-str">"weight"</span>: <span class="tok-num">400</span>,
+          <span class="tok-str">"path"</span>: <span class="tok-str">"/fonts/roboto/Roboto[wdth,wght].ttf"</span>
+        }
+      ]
+    }
+  ]
+}</code></pre>
+      </section>
+
+      <section id="family">
+        <h2>Family</h2>
+        <p>
+          <code>GET /fonts/&lt;slug&gt;</code> returns one family with the same fields plus its
+          variable-font <code>axes</code>.
+        </p>
+        <pre><code class="language-http"><span class="tok-method">GET</span> <span class="tok-path">/fonts/roboto</span></code></pre>
+        <pre><code class="language-json">{
+  <span class="tok-str">"slug"</span>: <span class="tok-str">"roboto"</span>,
+  <span class="tok-str">"name"</span>: <span class="tok-str">"Roboto"</span>,
+  <span class="tok-str">"variable"</span>: <span class="tok-bool">true</span>,
+  <span class="tok-str">"files"</span>: [ <span class="tok-str">"…"</span> ],
+  <span class="tok-str">"axes"</span>: [
+    { <span class="tok-str">"tag"</span>: <span class="tok-str">"wght"</span>, <span class="tok-str">"min"</span>: <span class="tok-num">100</span>, <span class="tok-str">"max"</span>: <span class="tok-num">900</span> }
+  ]
+}</code></pre>
+      </section>
+
+      <section id="download">
+        <h2>Download</h2>
+        <p>
+          <code>GET /fonts/&lt;slug&gt;/&lt;filename&gt;</code> returns the font file with the right
+          <code>font/*</code> content type and a long <code>Cache-Control</code>. Use a
+          <code>filename</code> from the family's <code>files</code> list; anything else is a
+          <code>404</code>.
+        </p>
+        <pre><code class="language-http"><span class="tok-method">GET</span> <span class="tok-path">/fonts/roboto/Roboto%5Bwdth,wght%5D.ttf</span></code></pre>
+        <p>Load one straight into a page with the CSS Font Loading API or an <code>@font-face</code>:</p>
+        <pre><code class="language-css"><span class="tok-kw">@font-face</span> {
+  <span class="tok-prop">font-family</span>: <span class="tok-str">"Roboto"</span>;
+  <span class="tok-prop">src</span>: <span class="tok-call">url</span>(<span class="tok-str">"https://cc.me/fonts/roboto/Roboto%5Bwdth,wght%5D.ttf"</span>) <span class="tok-call">format</span>(<span class="tok-str">"truetype"</span>);
+}</code></pre>
+      </section>
+
+      <section id="errors">
+        <h2>Errors</h2>
+        <dl>
+          <dt><code>404</code></dt>
+          <dd>Unknown family slug, or a filename not listed for that family.</dd>
+        </dl>
+      </section>
+
+      <footer>
+        By <a href="https://xmit.dev/">xmit dev team</a>. Font files come from the
+        <a href="https://github.com/google/fonts">Google Fonts</a> project under their respective
+        open licenses.
+      </footer>
+    </main>
+  </body>
+</html>

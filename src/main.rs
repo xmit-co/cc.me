@@ -2,8 +2,9 @@ use std::{
     collections::{HashMap, HashSet},
     env,
     net::{IpAddr, SocketAddr, ToSocketAddrs},
+    path::PathBuf,
     sync::{
-        Arc, LazyLock,
+        Arc, LazyLock, RwLock,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -98,6 +99,13 @@ const ICON_FETCH_TIMEOUT_SECONDS: u64 = 8;
 const ICON_MAX_REDIRECTS: usize = 5;
 const ICON_USER_AGENT: &str = "cc.me-favicon/1.0 (+https://cc.me/icon)";
 const MIGRATE_ADVISORY_LOCK: i64 = 0x6363_6d65; // "ccme"
+const DOCS_FONTS_HTML: &str = include_str!("../docs/fonts.html");
+const FONTS_DEFAULT_DIR: &str = "/var/lib/fonts";
+// Google Fonts groups families by license directory.
+const FONTS_LICENSE_DIRS: [&str; 4] = ["ofl", "apache", "ufl", "cc-by-sa"];
+const FONTS_DEFAULT_LIMIT: usize = 20;
+const FONTS_MAX_LIMIT: usize = 100;
+const FONTS_REFRESH_INTERVAL_SECONDS: u64 = 600;
 
 static EVENT_COUNTER: AtomicU64 = AtomicU64::new(0);
 static EVENT_PREFIX: LazyLock<String> = LazyLock::new(|| {
@@ -116,7 +124,20 @@ struct AppState {
     library_tx: broadcast::Sender<String>,
     stats_tx: mpsc::Sender<StatEvent>,
     http: reqwest::Client,
+    fonts: Arc<RwLock<Arc<FontIndex>>>,
     config: Config,
+}
+
+impl AppState {
+    // Cheap lock-free-ish read: clone the current index Arc out of the lock so
+    // handlers never hold the lock (which the refresh worker takes to swap) across
+    // an await or a long scan.
+    fn fonts_snapshot(&self) -> Arc<FontIndex> {
+        self.fonts
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
 }
 
 #[derive(Clone)]
@@ -134,6 +155,8 @@ struct Config {
     secret_max_ttl_hours: u64,
     secret_max_bytes: usize,
     secret_cleanup_interval_seconds: u64,
+    fonts_dir: PathBuf,
+    fonts_refresh_interval_seconds: u64,
 }
 
 #[derive(Debug)]
@@ -443,11 +466,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let http = build_http_client();
 
+    let fonts_dir = config.fonts_dir.clone();
+    let initial_fonts = {
+        let dir = fonts_dir.clone();
+        tokio::task::spawn_blocking(move || FontIndex::load(&dir)).await?
+    };
+    info!(
+        "indexed {} font families from {}",
+        initial_fonts.families.len(),
+        config.fonts_dir.display()
+    );
+    let fonts = Arc::new(RwLock::new(Arc::new(initial_fonts)));
+    if config.fonts_refresh_interval_seconds > 0 {
+        tokio::spawn(fonts_refresh_worker(
+            fonts_dir,
+            Duration::from_secs(config.fonts_refresh_interval_seconds),
+            fonts.clone(),
+        ));
+    }
+
     let app = Router::new()
         .route("/", get(root))
         .route("/http", get(http_docs))
         .route("/lib", get(library_docs))
         .route("/icon", get(icon))
+        .route("/fonts", get(fonts_search))
+        .route("/fonts/{slug}", get(font_family))
+        .route("/fonts/{slug}/{filename}", get(font_file))
         .route(
             "/l/{id}",
             put(put_resource).get(get_resource).delete(delete_resource),
@@ -501,6 +546,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             library_tx,
             stats_tx,
             http,
+            fonts,
             config: config.clone(),
         });
 
@@ -1294,6 +1340,427 @@ fn ip_is_forbidden(ip: &IpAddr) -> bool {
                 || (segments[0] & 0xfe00) == 0xfc00 // unique local fc00::/7
                 || (segments[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
         }
+    }
+}
+
+// ------------------------------------------------------------------
+// Fonts: search and download over a clone of github.com/google/fonts.
+// The clone lives at FONTS_DIR (default /var/lib/fonts) and is indexed
+// into memory at startup; nothing is stored in Postgres.
+// ------------------------------------------------------------------
+
+#[derive(Default, Clone)]
+struct FontFile {
+    filename: String,
+    style: Option<String>,
+    weight: Option<i64>,
+}
+
+#[derive(Default, Clone)]
+struct FontAxis {
+    tag: String,
+    min: Option<f64>,
+    max: Option<f64>,
+}
+
+struct FontFamily {
+    slug: String,
+    name: String,
+    name_lower: String,
+    license: String,
+    category: Option<String>,
+    designer: Option<String>,
+    subsets: Vec<String>,
+    files: Vec<FontFile>,
+    axes: Vec<FontAxis>,
+    dir: PathBuf,
+}
+
+struct FontIndex {
+    families: Vec<FontFamily>,
+    by_slug: HashMap<String, usize>,
+}
+
+impl FontIndex {
+    #[cfg(test)]
+    fn empty() -> Self {
+        Self {
+            families: Vec::new(),
+            by_slug: HashMap::new(),
+        }
+    }
+
+    // Walk each license directory for family folders and parse their METADATA.pb.
+    // Missing or unreadable entries are skipped so a partial clone still serves.
+    fn load(dir: &std::path::Path) -> Self {
+        let mut families = Vec::new();
+        for license in FONTS_LICENSE_DIRS {
+            let Ok(entries) = std::fs::read_dir(dir.join(license)) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let family_dir = entry.path();
+                if !family_dir.is_dir() {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(family_dir.join("METADATA.pb")) else {
+                    continue;
+                };
+                let Ok(slug) = entry.file_name().into_string() else {
+                    continue;
+                };
+                let metadata = parse_font_metadata(&text);
+                let name = if metadata.name.is_empty() {
+                    slug.clone()
+                } else {
+                    metadata.name
+                };
+                families.push(FontFamily {
+                    name_lower: name.to_lowercase(),
+                    slug,
+                    name,
+                    license: license.to_owned(),
+                    category: metadata.category,
+                    designer: metadata.designer,
+                    subsets: metadata.subsets,
+                    files: metadata.fonts,
+                    axes: metadata.axes,
+                    dir: family_dir,
+                });
+            }
+        }
+        families.sort_by(|a, b| a.name.cmp(&b.name));
+        let by_slug = families
+            .iter()
+            .enumerate()
+            .map(|(index, family)| (family.slug.to_lowercase(), index))
+            .collect();
+        Self { families, by_slug }
+    }
+
+    fn get(&self, slug: &str) -> Option<&FontFamily> {
+        self.by_slug
+            .get(&slug.to_lowercase())
+            .map(|&index| &self.families[index])
+    }
+}
+
+// Periodically re-index the clone (e.g. after a `git pull`) and swap the result
+// in atomically. Interval 0 disables refresh (handled by the caller).
+async fn fonts_refresh_worker(
+    dir: PathBuf,
+    interval: Duration,
+    handle: Arc<RwLock<Arc<FontIndex>>>,
+) {
+    loop {
+        tokio::time::sleep(interval).await;
+        let dir = dir.clone();
+        match tokio::task::spawn_blocking(move || FontIndex::load(&dir)).await {
+            Ok(index) => {
+                let count = index.families.len();
+                *handle.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::new(index);
+                info!("refreshed {count} font families");
+            }
+            Err(err) => error!(%err, "font index refresh failed"),
+        }
+    }
+}
+
+#[derive(Default)]
+struct FontMetadata {
+    name: String,
+    designer: Option<String>,
+    category: Option<String>,
+    subsets: Vec<String>,
+    fonts: Vec<FontFile>,
+    axes: Vec<FontAxis>,
+}
+
+enum MetaBlock {
+    Fonts,
+    Axes,
+    Other,
+}
+
+// A focused reader for the fields we serve out of protobuf text-format
+// METADATA.pb. The format is line-oriented: `key: value`, `key {` opening a
+// nested message, and `}` closing it. We only descend into `fonts {}` and
+// `axes {}` (one level), and ignore everything else.
+fn parse_font_metadata(text: &str) -> FontMetadata {
+    let mut metadata = FontMetadata::default();
+    let mut depth = 0usize;
+    let mut block: Option<MetaBlock> = None;
+    let mut font = FontFile::default();
+    let mut axis = FontAxis::default();
+
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(key) = line.strip_suffix('{') {
+            if depth == 0 {
+                block = Some(match key.trim() {
+                    "fonts" => MetaBlock::Fonts,
+                    "axes" => MetaBlock::Axes,
+                    _ => MetaBlock::Other,
+                });
+                font = FontFile::default();
+                axis = FontAxis::default();
+            }
+            depth += 1;
+            continue;
+        }
+        if line == "}" {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                match block {
+                    Some(MetaBlock::Fonts) if !font.filename.is_empty() => {
+                        metadata.fonts.push(std::mem::take(&mut font));
+                    }
+                    Some(MetaBlock::Axes) if !axis.tag.is_empty() => {
+                        metadata.axes.push(std::mem::take(&mut axis));
+                    }
+                    _ => {}
+                }
+                block = None;
+            }
+            continue;
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let (key, value) = (key.trim(), value.trim());
+        match (depth, block.as_ref()) {
+            (0, _) => match key {
+                "name" => metadata.name = unquote_textproto(value),
+                "designer" => metadata.designer = Some(unquote_textproto(value)),
+                "category" => metadata.category = Some(unquote_textproto(value)),
+                "subsets" => {
+                    let subset = unquote_textproto(value);
+                    if !subset.is_empty() {
+                        metadata.subsets.push(subset);
+                    }
+                }
+                _ => {}
+            },
+            (1, Some(MetaBlock::Fonts)) => match key {
+                "filename" => font.filename = unquote_textproto(value),
+                "style" => font.style = Some(unquote_textproto(value)),
+                "weight" => font.weight = value.parse().ok(),
+                _ => {}
+            },
+            (1, Some(MetaBlock::Axes)) => match key {
+                "tag" => axis.tag = unquote_textproto(value),
+                "min_value" => axis.min = value.parse().ok(),
+                "max_value" => axis.max = value.parse().ok(),
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    metadata
+}
+
+fn unquote_textproto(value: &str) -> String {
+    let bytes = value.as_bytes();
+    if bytes.len() >= 2 && bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"' {
+        value[1..value.len() - 1]
+            .replace("\\\"", "\"")
+            .replace("\\\\", "\\")
+    } else {
+        value.to_owned()
+    }
+}
+
+#[derive(Serialize)]
+struct FontFileEntry {
+    filename: String,
+    style: Option<String>,
+    weight: Option<i64>,
+    path: String,
+}
+
+#[derive(Serialize)]
+struct FontAxisEntry {
+    tag: String,
+    min: Option<f64>,
+    max: Option<f64>,
+}
+
+#[derive(Serialize)]
+struct FontSummary {
+    slug: String,
+    name: String,
+    license: String,
+    category: Option<String>,
+    designer: Option<String>,
+    subsets: Vec<String>,
+    variable: bool,
+    files: Vec<FontFileEntry>,
+}
+
+#[derive(Serialize)]
+struct FontDetail {
+    #[serde(flatten)]
+    summary: FontSummary,
+    axes: Vec<FontAxisEntry>,
+}
+
+#[derive(Serialize)]
+struct FontSearchResponse {
+    total: usize,
+    count: usize,
+    offset: usize,
+    limit: usize,
+    families: Vec<FontSummary>,
+}
+
+fn font_summary(family: &FontFamily) -> FontSummary {
+    FontSummary {
+        slug: family.slug.clone(),
+        name: family.name.clone(),
+        license: family.license.clone(),
+        category: family.category.clone(),
+        designer: family.designer.clone(),
+        subsets: family.subsets.clone(),
+        variable: !family.axes.is_empty(),
+        files: family
+            .files
+            .iter()
+            .map(|file| FontFileEntry {
+                path: format!("/fonts/{}/{}", family.slug, file.filename),
+                filename: file.filename.clone(),
+                style: file.style.clone(),
+                weight: file.weight,
+            })
+            .collect(),
+    }
+}
+
+// `GET /fonts` — search when a query string is present, otherwise the docs page.
+// Filters: q (name/slug substring), category, subset; paginated with limit/offset.
+async fn fonts_search(
+    State(state): State<AppState>,
+    RawQuery(raw_query): RawQuery,
+) -> AppResult<Response> {
+    let Some(query) = raw_query.as_deref().filter(|query| !query.is_empty()) else {
+        return Ok(docs_html(DOCS_FONTS_HTML));
+    };
+
+    let mut q = String::new();
+    let mut category: Option<String> = None;
+    let mut subset: Option<String> = None;
+    let mut limit = FONTS_DEFAULT_LIMIT;
+    let mut offset = 0usize;
+    for (key, value) in form_urlencoded::parse(query.as_bytes()) {
+        match key.as_ref() {
+            "q" => q = value.into_owned().to_lowercase(),
+            "category" => category = Some(value.into_owned().to_uppercase()),
+            "subset" => subset = Some(value.into_owned().to_lowercase()),
+            "limit" => {
+                limit = value
+                    .parse::<usize>()
+                    .unwrap_or(FONTS_DEFAULT_LIMIT)
+                    .clamp(1, FONTS_MAX_LIMIT);
+            }
+            "offset" => offset = value.parse::<usize>().unwrap_or(0),
+            _ => {}
+        }
+    }
+
+    let fonts = state.fonts_snapshot();
+    let matched = fonts.families.iter().filter(|family| {
+        (q.is_empty() || family.name_lower.contains(&q) || family.slug.contains(&q))
+            && category
+                .as_deref()
+                .is_none_or(|wanted| family.category.as_deref() == Some(wanted))
+            && subset
+                .as_deref()
+                .is_none_or(|wanted| family.subsets.iter().any(|subset| subset == wanted))
+    });
+
+    let total = matched.clone().count();
+    let families: Vec<FontSummary> = matched.skip(offset).take(limit).map(font_summary).collect();
+
+    Ok(Json(FontSearchResponse {
+        total,
+        count: families.len(),
+        offset,
+        limit,
+        families,
+    })
+    .into_response())
+}
+
+async fn font_family(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+) -> AppResult<Json<FontDetail>> {
+    let fonts = state.fonts_snapshot();
+    let family = fonts
+        .get(&slug)
+        .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "font family not found"))?;
+    Ok(Json(FontDetail {
+        summary: font_summary(family),
+        axes: family
+            .axes
+            .iter()
+            .map(|axis| FontAxisEntry {
+                tag: axis.tag.clone(),
+                min: axis.min,
+                max: axis.max,
+            })
+            .collect(),
+    }))
+}
+
+async fn font_file(
+    State(state): State<AppState>,
+    Path((slug, filename)): Path<(String, String)>,
+) -> AppResult<Response> {
+    let fonts = state.fonts_snapshot();
+    let family = fonts
+        .get(&slug)
+        .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "font family not found"))?;
+    // Only serve files listed in the family's metadata — this whitelist is what
+    // prevents path traversal out of the family directory.
+    if !family.files.iter().any(|file| file.filename == filename) {
+        return Err(AppError::new(StatusCode::NOT_FOUND, "font file not found"));
+    }
+    let bytes = tokio::fs::read(family.dir.join(&filename))
+        .await
+        .map_err(|_| AppError::new(StatusCode::NOT_FOUND, "font file not found"))?;
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, font_content_type(&filename).to_owned()),
+            (
+                header::CACHE_CONTROL,
+                "public, max-age=604800".to_owned(),
+            ),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("inline; filename=\"{filename}\""),
+            ),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
+fn font_content_type(filename: &str) -> &'static str {
+    let lower = filename.to_ascii_lowercase();
+    if lower.ends_with(".woff2") {
+        "font/woff2"
+    } else if lower.ends_with(".woff") {
+        "font/woff"
+    } else if lower.ends_with(".otf") {
+        "font/otf"
+    } else if lower.ends_with(".ttf") {
+        "font/ttf"
+    } else {
+        "application/octet-stream"
     }
 }
 
@@ -4085,6 +4552,13 @@ impl Config {
             secret_max_ttl_hours,
             secret_max_bytes: env_usize("SECRET_MAX_BYTES", SECRET_MAX_BYTES).max(1024),
             secret_cleanup_interval_seconds: env_u64("SECRET_CLEANUP_INTERVAL_SECONDS", SECRET_CLEANUP_INTERVAL_SECONDS).max(1),
+            fonts_dir: env::var_os("FONTS_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(FONTS_DEFAULT_DIR)),
+            fonts_refresh_interval_seconds: env_u64(
+                "FONTS_REFRESH_INTERVAL_SECONDS",
+                FONTS_REFRESH_INTERVAL_SECONDS,
+            ),
         })
     }
 }
@@ -4726,6 +5200,8 @@ mod tests {
             secret_max_ttl_hours: 168,
             secret_max_bytes: 262144,
             secret_cleanup_interval_seconds: 60,
+            fonts_dir: PathBuf::from("/var/lib/fonts"),
+            fonts_refresh_interval_seconds: 0,
         }
     }
 
@@ -4763,6 +5239,8 @@ mod tests {
             secret_max_ttl_hours: 168,
             secret_max_bytes: 262144,
             secret_cleanup_interval_seconds: 60,
+            fonts_dir: PathBuf::from("/var/lib/fonts"),
+            fonts_refresh_interval_seconds: 0,
         };
 
         let router = Router::new()
@@ -4778,6 +5256,7 @@ mod tests {
                 library_tx,
                 stats_tx,
                 http: build_http_client(),
+                fonts: Arc::new(RwLock::new(Arc::new(FontIndex::empty()))),
                 config,
             });
 
@@ -5680,5 +6159,211 @@ mod tests {
         );
         // An HTML 404 page served with 200 must not pass as an image.
         assert_eq!(sniff_image_content_type(b"<!doctype html><title>Not found</title>"), None);
+    }
+
+    // ------------------------------------------------------------------
+    // Fonts
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn parse_font_metadata_reads_core_fields() {
+        let text = r#"
+name: "Test Sans"
+designer: "A. Designer"
+license: "OFL"
+category: "SANS_SERIF"
+fonts {
+  name: "Test Sans"
+  style: "normal"
+  weight: 400
+  filename: "TestSans[wght].ttf"
+}
+fonts {
+  style: "italic"
+  weight: 700
+  filename: "TestSans-BoldItalic.ttf"
+}
+subsets: "latin"
+subsets: "greek"
+axes {
+  tag: "wght"
+  min_value: 100.0
+  max_value: 900.0
+}
+"#;
+        let md = parse_font_metadata(text);
+        assert_eq!(md.name, "Test Sans");
+        assert_eq!(md.designer.as_deref(), Some("A. Designer"));
+        assert_eq!(md.category.as_deref(), Some("SANS_SERIF"));
+        assert_eq!(md.subsets, vec!["latin", "greek"]);
+        assert_eq!(md.fonts.len(), 2);
+        assert_eq!(md.fonts[0].filename, "TestSans[wght].ttf");
+        assert_eq!(md.fonts[0].weight, Some(400));
+        assert_eq!(md.fonts[1].style.as_deref(), Some("italic"));
+        assert_eq!(md.axes.len(), 1);
+        assert_eq!(md.axes[0].tag, "wght");
+        assert_eq!(md.axes[0].max, Some(900.0));
+    }
+
+    #[test]
+    fn unquote_textproto_handles_quotes_and_escapes() {
+        assert_eq!(unquote_textproto(r#""hello""#), "hello");
+        assert_eq!(unquote_textproto(r#""a\"b""#), "a\"b");
+        assert_eq!(unquote_textproto("SANS_SERIF"), "SANS_SERIF");
+        assert_eq!(unquote_textproto("400"), "400");
+    }
+
+    fn write_test_family(root: &std::path::Path) {
+        let family = root.join("ofl").join("testsans");
+        std::fs::create_dir_all(&family).unwrap();
+        std::fs::write(
+            family.join("METADATA.pb"),
+            "name: \"Test Sans\"\ncategory: \"SANS_SERIF\"\nsubsets: \"latin\"\nfonts {\n  filename: \"TestSans-Regular.ttf\"\n  weight: 400\n}\n",
+        )
+        .unwrap();
+        std::fs::write(family.join("TestSans-Regular.ttf"), b"\x00\x01\x00\x00fake-ttf").unwrap();
+    }
+
+    #[test]
+    fn font_index_loads_and_finds_by_slug() {
+        let root = std::env::temp_dir().join(format!("ccme-fonts-{}", Uuid::new_v4()));
+        write_test_family(&root);
+
+        let index = FontIndex::load(&root);
+        assert_eq!(index.families.len(), 1);
+        let family = index.get("TestSans").expect("slug lookup is case-insensitive");
+        assert_eq!(family.name, "Test Sans");
+        assert_eq!(family.files[0].filename, "TestSans-Regular.ttf");
+        assert!(index.get("missing").is_none());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    fn fonts_test_router(fonts: FontIndex) -> Router {
+        // A lazy pool never connects; the fonts handlers don't touch the DB.
+        let db = PgPoolOptions::new()
+            .connect_lazy("postgres://cc_me@127.0.0.1:55432/cc_me")
+            .unwrap();
+        let (inbox_tx, _) = broadcast::channel(16);
+        let (library_tx, _) = broadcast::channel(16);
+        let (stats_tx, _) = mpsc::channel(16);
+        let config = Config {
+            bind_addr: "127.0.0.1:3000".parse().unwrap(),
+            database_url: "postgres://cc_me@127.0.0.1:55432/cc_me".to_owned(),
+            max_requests: 100,
+            default_get_limit: 1,
+            max_get_limit: 1000,
+            long_poll_seconds: 25.0,
+            library_max_count: 100,
+            library_max_ttl_seconds: 60.0,
+            library_max_wait_seconds: 5.0,
+            secret_default_ttl_hours: 24,
+            secret_max_ttl_hours: 168,
+            secret_max_bytes: 262144,
+            secret_cleanup_interval_seconds: 60,
+            fonts_dir: PathBuf::from("/var/lib/fonts"),
+            fonts_refresh_interval_seconds: 0,
+        };
+        Router::new()
+            .route("/fonts", get(fonts_search))
+            .route("/fonts/{slug}", get(font_family))
+            .route("/fonts/{slug}/{filename}", get(font_file))
+            .with_state(AppState {
+                db,
+                inbox_tx,
+                library_tx,
+                stats_tx,
+                http: build_http_client(),
+                fonts: Arc::new(RwLock::new(Arc::new(fonts))),
+                config,
+            })
+    }
+
+    #[tokio::test]
+    async fn fonts_http_search_detail_and_download() {
+        let root = std::env::temp_dir().join(format!("ccme-fonts-{}", Uuid::new_v4()));
+        write_test_family(&root);
+        let router = fonts_test_router(FontIndex::load(&root));
+
+        // Search.
+        let (status, body): (StatusCode, serde_json::Value) = json_status(
+            router
+                .clone()
+                .oneshot(library_request("GET", "/fonts?q=test&category=SANS_SERIF", None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["total"], 1);
+        assert_eq!(body["families"][0]["slug"], "testsans");
+        assert_eq!(
+            body["families"][0]["files"][0]["path"],
+            "/fonts/testsans/TestSans-Regular.ttf"
+        );
+
+        // No query string → docs page (HTML), not JSON.
+        let response = router
+            .clone()
+            .oneshot(library_request("GET", "/fonts", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "text/html; charset=utf-8"
+        );
+
+        // Family detail.
+        let (status, _body): (StatusCode, serde_json::Value) = json_status(
+            router
+                .clone()
+                .oneshot(library_request("GET", "/fonts/testsans", None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Download the listed file.
+        let response = router
+            .clone()
+            .oneshot(library_request(
+                "GET",
+                "/fonts/testsans/TestSans-Regular.ttf",
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "font/ttf"
+        );
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&bytes[..], b"\x00\x01\x00\x00fake-ttf");
+
+        // A file not listed in the family is rejected (path-traversal whitelist).
+        let response = router
+            .clone()
+            .oneshot(library_request("GET", "/fonts/testsans/OFL.txt", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // Unknown family.
+        let response = router
+            .clone()
+            .oneshot(library_request("GET", "/fonts/missing", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }
