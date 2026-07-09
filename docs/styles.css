@@ -186,10 +186,20 @@ dd {
   font-family: ui-monospace, monospace;
   font-variant-numeric: tabular-nums;
 }
+.stats {
+  padding-top: 1.75em;
+}
+.stats summary {
+  cursor: pointer;
+}
+.stats summary h2 {
+  display: inline;
+}
 .charts {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 18em), 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 22em), 1fr));
   gap: 1em;
+  margin-top: 1em;
 }
 .charts article {
   padding: 0.75em;
@@ -199,6 +209,20 @@ dd {
 }
 .charts h3 {
   font-size: 1em;
+  margin-bottom: 0.5em;
+}
+.charts .pair {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.75em;
+}
+.charts figure {
+  margin: 0;
+}
+.charts figcaption {
+  font-size: 0.8em;
+  color: var(--m);
+  font-family: ui-monospace, monospace;
 }
 .charts canvas {
   width: 100%;

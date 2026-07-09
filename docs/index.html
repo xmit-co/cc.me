@@ -60,59 +60,67 @@
         </section>
       </div>
 
-      <section id="stats" class="stats">
-        <h2>Stats</h2>
+      <details id="stats" class="stats">
+        <summary><h2>Stats</h2></summary>
         <div class="charts">
           <article>
-            <h3>Redirects, 48h</h3>
-            <canvas id="h-redirects"></canvas>
+            <h3>Redirects</h3>
+            <div class="pair">
+              <figure><figcaption>48h</figcaption><canvas id="h-redirects"></canvas></figure>
+              <figure><figcaption>30d</figcaption><canvas id="d-redirects"></canvas></figure>
+            </div>
           </article>
           <article>
-            <h3>Inboxes, 48h</h3>
-            <canvas id="h-inboxes"></canvas>
+            <h3>Inboxes</h3>
+            <div class="pair">
+              <figure><figcaption>48h</figcaption><canvas id="h-inboxes"></canvas></figure>
+              <figure><figcaption>30d</figcaption><canvas id="d-inboxes"></canvas></figure>
+            </div>
           </article>
           <article>
-            <h3>Inboxed, 48h</h3>
-            <canvas id="h-inboxed_messages"></canvas>
+            <h3>Inboxed</h3>
+            <div class="pair">
+              <figure><figcaption>48h</figcaption><canvas id="h-inboxed_messages"></canvas></figure>
+              <figure><figcaption>30d</figcaption><canvas id="d-inboxed_messages"></canvas></figure>
+            </div>
           </article>
           <article>
-            <h3>Aliases, 48h</h3>
-            <canvas id="h-aliases"></canvas>
+            <h3>Aliases</h3>
+            <div class="pair">
+              <figure><figcaption>48h</figcaption><canvas id="h-aliases"></canvas></figure>
+              <figure><figcaption>30d</figcaption><canvas id="d-aliases"></canvas></figure>
+            </div>
           </article>
           <article>
-            <h3>Forwarded, 48h</h3>
-            <canvas id="h-forwarded"></canvas>
+            <h3>Forwarded</h3>
+            <div class="pair">
+              <figure><figcaption>48h</figcaption><canvas id="h-forwarded"></canvas></figure>
+              <figure><figcaption>30d</figcaption><canvas id="d-forwarded"></canvas></figure>
+            </div>
           </article>
           <article>
-            <h3>Secrets, 48h</h3>
-            <canvas id="h-secrets"></canvas>
+            <h3>Secrets</h3>
+            <div class="pair">
+              <figure><figcaption>48h</figcaption><canvas id="h-secrets"></canvas></figure>
+              <figure><figcaption>30d</figcaption><canvas id="d-secrets"></canvas></figure>
+            </div>
           </article>
           <article>
-            <h3>Redirects, 30d</h3>
-            <canvas id="d-redirects"></canvas>
+            <h3>Favicons</h3>
+            <div class="pair">
+              <figure><figcaption>48h</figcaption><canvas id="h-favicons"></canvas></figure>
+              <figure><figcaption>30d</figcaption><canvas id="d-favicons"></canvas></figure>
+            </div>
           </article>
           <article>
-            <h3>Inboxes, 30d</h3>
-            <canvas id="d-inboxes"></canvas>
-          </article>
-          <article>
-            <h3>Inboxed, 30d</h3>
-            <canvas id="d-inboxed_messages"></canvas>
-          </article>
-          <article>
-            <h3>Aliases, 30d</h3>
-            <canvas id="d-aliases"></canvas>
-          </article>
-          <article>
-            <h3>Forwarded, 30d</h3>
-            <canvas id="d-forwarded"></canvas>
-          </article>
-          <article>
-            <h3>Secrets, 30d</h3>
-            <canvas id="d-secrets"></canvas>
+            <h3>Fonts</h3>
+            <div class="pair">
+              <figure><figcaption>48h</figcaption><canvas id="h-fonts"></canvas></figure>
+              <figure><figcaption>30d</figcaption><canvas id="d-fonts"></canvas></figure>
+            </div>
           </article>
         </div>
-      </section>
+      </details>
 
       <footer>
         By <a href="https://xmit.dev/">xmit dev team</a>, hosted in the EU on renewable energy. We
@@ -183,6 +191,8 @@
           "aliases",
           "forwarded",
           "secrets",
+          "favicons",
+          "fonts",
         ]) {
           drawSparkline(
             `${prefix}-${key}`,
@@ -191,15 +201,25 @@
           );
         }
       };
-      fetch("/stats")
-        .then((r) => r.json())
-        .then((s) => {
-          draw("h", s.hourly, s.last_48_hours);
-          draw("d", s.daily, s.last_30_days);
-        })
-        .catch(() => {
-          document.querySelector(".charts").textContent = "Stats unavailable";
-        });
+      const stats = document.getElementById("stats");
+      let loaded = false;
+      const loadStats = () => {
+        if (loaded) return;
+        loaded = true;
+        fetch("/stats")
+          .then((r) => r.json())
+          .then((s) => {
+            draw("h", s.hourly, s.last_48_hours);
+            draw("d", s.daily, s.last_30_days);
+          })
+          .catch(() => {
+            loaded = false;
+            document.querySelector(".charts").textContent = "Stats unavailable";
+          });
+      };
+      stats.addEventListener("toggle", () => {
+        if (stats.open) loadStats();
+      });
     </script>
   </body>
 </html>

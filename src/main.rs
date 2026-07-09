@@ -394,6 +394,8 @@ struct StatsBucket {
     aliases: usize,
     forwarded: usize,
     secrets: usize,
+    favicons: usize,
+    fonts: usize,
 }
 
 #[derive(Serialize)]
@@ -404,6 +406,8 @@ struct StatCounts {
     aliases: usize,
     forwarded: usize,
     secrets: usize,
+    favicons: usize,
+    fonts: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -1014,7 +1018,10 @@ async fn icon(State(state): State<AppState>, RawQuery(raw_query): RawQuery) -> A
 
     if let Some(hit) = favicon_cache_lookup(&state, &origin).await? {
         return match hit {
-            Some((content_type, bytes)) => Ok(icon_image_response(&content_type, bytes)),
+            Some((content_type, bytes)) => {
+                record_stat_soon(&state, StatKind::Favicon, None);
+                Ok(icon_image_response(&content_type, bytes))
+            }
             None => Err(icon_not_found()),
         };
     }
@@ -1022,6 +1029,7 @@ async fn icon(State(state): State<AppState>, RawQuery(raw_query): RawQuery) -> A
     match fetch_favicon(&state.http, &origin).await {
         Some((content_type, bytes)) => {
             favicon_cache_store(&state, &origin, Some((&content_type, &bytes))).await?;
+            record_stat_soon(&state, StatKind::Favicon, None);
             Ok(icon_image_response(&content_type, bytes))
         }
         None => {
@@ -1731,6 +1739,7 @@ async fn font_file(
     let bytes = tokio::fs::read(family.dir.join(&filename))
         .await
         .map_err(|_| AppError::new(StatusCode::NOT_FOUND, "font file not found"))?;
+    record_stat_soon(&state, StatKind::Font, None);
     Ok((
         StatusCode::OK,
         [
@@ -3209,6 +3218,9 @@ async fn load_stats(state: &AppState) -> AppResult<StatsResponse> {
         )
         .await?,
         secrets: count_total(&state.db, StatKind::Secret, StatPeriod::Hour, &hour_buckets).await?,
+        favicons: count_total(&state.db, StatKind::Favicon, StatPeriod::Hour, &hour_buckets)
+            .await?,
+        fonts: count_total(&state.db, StatKind::Font, StatPeriod::Hour, &hour_buckets).await?,
     };
     let last_30_days = StatCounts {
         redirects: count_total(&state.db, StatKind::Redirect, StatPeriod::Day, &day_buckets)
@@ -3219,6 +3231,8 @@ async fn load_stats(state: &AppState) -> AppResult<StatsResponse> {
         aliases: count_total(&state.db, StatKind::Alias, StatPeriod::Day, &day_buckets).await?,
         forwarded: count_total(&state.db, StatKind::Forward, StatPeriod::Day, &day_buckets).await?,
         secrets: count_total(&state.db, StatKind::Secret, StatPeriod::Day, &day_buckets).await?,
+        favicons: count_total(&state.db, StatKind::Favicon, StatPeriod::Day, &day_buckets).await?,
+        fonts: count_total(&state.db, StatKind::Font, StatPeriod::Day, &day_buckets).await?,
     };
 
     let hourly = stat_buckets(&state.db, hour_buckets, 3600, StatPeriod::Hour).await?;
@@ -3245,6 +3259,8 @@ async fn stat_buckets(
     let aliases = count_series(db, StatKind::Alias, period, &buckets).await?;
     let forwarded = count_series(db, StatKind::Forward, period, &buckets).await?;
     let secrets = count_series(db, StatKind::Secret, period, &buckets).await?;
+    let favicons = count_series(db, StatKind::Favicon, period, &buckets).await?;
+    let fonts = count_series(db, StatKind::Font, period, &buckets).await?;
 
     Ok(buckets
         .into_iter()
@@ -3256,6 +3272,8 @@ async fn stat_buckets(
             aliases: *aliases.get(&bucket).unwrap_or(&0),
             forwarded: *forwarded.get(&bucket).unwrap_or(&0),
             secrets: *secrets.get(&bucket).unwrap_or(&0),
+            favicons: *favicons.get(&bucket).unwrap_or(&0),
+            fonts: *fonts.get(&bucket).unwrap_or(&0),
         })
         .collect())
 }
@@ -3456,6 +3474,8 @@ async fn record_stat_batch(db: &PgPool, batch: &[StatEvent]) -> AppResult<()> {
             StatKind::Alias,
             StatKind::Forward,
             StatKind::Secret,
+            StatKind::Favicon,
+            StatKind::Font,
         ] {
             let count = batch.iter().filter(|event| event.kind == kind).count();
             if count > 0 {
@@ -4395,6 +4415,8 @@ enum StatKind {
     Alias,
     Forward,
     Secret,
+    Favicon,
+    Font,
 }
 
 impl StatKind {
@@ -4406,6 +4428,8 @@ impl StatKind {
             Self::Alias => "a",
             Self::Forward => "f",
             Self::Secret => "s",
+            Self::Favicon => "c",
+            Self::Font => "o",
         }
     }
 }
