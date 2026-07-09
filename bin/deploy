@@ -1,5 +1,5 @@
 #!/usr/bin/env sh
 set -eux
 cargo build --release
-rsync -avP target/release/cc-me{,-mail} horse:
-ssh horse sh -c "'doas systemctl stop cc-me; doas cp cc-me cc-me-mail /usr/local/bin/; doas systemctl start cc-me'"
+rsync -avP target/release/cc-me{,-mail} ident:
+ssh ident sh -c "'systemctl stop cc-me; cp cc-me cc-me-mail /usr/local/bin/; systemctl start cc-me'"
