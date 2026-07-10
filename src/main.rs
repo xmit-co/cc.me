@@ -19,7 +19,10 @@ use axum::{
     response::{Html, IntoResponse, Response},
     routing::{delete, get, post, put},
 };
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{
+    Engine,
+    engine::general_purpose::{self, URL_SAFE_NO_PAD},
+};
 use crypto_box::{
     PublicKey,
     aead::rand_core::{OsRng, TryRngCore},
@@ -1172,6 +1175,14 @@ async fn fetch_favicon(client: &reqwest::Client, origin: &str) -> Option<(String
     if let Some(html) = fetch_text(client, origin, ICON_MAX_HTML_BYTES).await {
         if let Ok(base) = Url::parse(origin) {
             for href in extract_icon_hrefs(&html) {
+                // Inline `data:` icons (e.g. the emoji-favicon trick) carry the
+                // image directly — decode and return it without a network hop.
+                if href.starts_with("data:") || href.starts_with("DATA:") {
+                    if let Some(image) = decode_data_uri(&href) {
+                        return Some(image);
+                    }
+                    continue;
+                }
                 if let Ok(absolute) = base.join(&href) {
                     if matches!(absolute.scheme(), "http" | "https") {
                         candidates.push(absolute.to_string());
@@ -1188,6 +1199,42 @@ async fn fetch_favicon(client: &reqwest::Client, origin: &str) -> Option<(String
         }
     }
     None
+}
+
+// Decode a `data:` URI into (content_type, bytes), per RFC 2397. Handles both
+// base64 and percent-encoded payloads. Only image payloads are accepted: a
+// declared `image/*` media type is trusted (mirroring fetch_image's handling of
+// server content types), otherwise the bytes must sniff as a known image format.
+fn decode_data_uri(uri: &str) -> Option<(String, Vec<u8>)> {
+    let rest = uri.get("data:".len()..)?;
+    let (meta, data) = rest.split_once(',')?;
+    let meta_lower = meta.to_ascii_lowercase();
+    let is_base64 = meta_lower.ends_with(";base64");
+    let media_type = meta_lower
+        .strip_suffix(";base64")
+        .unwrap_or(&meta_lower)
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim();
+
+    let bytes = if is_base64 {
+        // Base64 data URIs may contain whitespace that must be stripped first.
+        let cleaned: String = data.chars().filter(|c| !c.is_whitespace()).collect();
+        general_purpose::STANDARD.decode(cleaned).ok()?
+    } else {
+        percent_encoding::percent_decode_str(data).collect()
+    };
+    if bytes.is_empty() || bytes.len() > ICON_MAX_BYTES {
+        return None;
+    }
+
+    let content_type = if media_type.starts_with("image/") {
+        media_type.to_owned()
+    } else {
+        sniff_image_content_type(&bytes)?.to_owned()
+    };
+    Some((content_type, bytes))
 }
 
 async fn fetch_text(client: &reqwest::Client, url: &str, cap: usize) -> Option<String> {
@@ -6163,6 +6210,39 @@ mod tests {
         assert!(hrefs.contains(&"/apple.png?v=2&x=1".to_owned()));
         // Non-icon links are ignored.
         assert!(!hrefs.iter().any(|h| h.contains("style.css") || h == "/self"));
+    }
+
+    #[test]
+    fn decode_data_uri_handles_inline_icons() {
+        // The emoji-favicon trick: an SVG declared inline, spaces and quotes raw.
+        let (ct, bytes) = decode_data_uri(
+            r#"data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg">x</svg>"#,
+        )
+        .unwrap();
+        assert_eq!(ct, "image/svg+xml");
+        assert!(String::from_utf8_lossy(&bytes).contains("<svg"));
+
+        // Percent-encoded payloads are decoded.
+        let (_, bytes) = decode_data_uri("data:image/svg+xml,%3Csvg%3E%3C/svg%3E").unwrap();
+        assert_eq!(bytes, b"<svg></svg>");
+
+        // Base64 payloads (a 1x1 transparent GIF) are decoded and, since a media
+        // type is declared, trusted.
+        let (ct, bytes) = decode_data_uri(
+            "data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==",
+        )
+        .unwrap();
+        assert_eq!(ct, "image/gif");
+        assert_eq!(&bytes[..3], b"GIF");
+
+        // No declared image type: accepted only if the bytes sniff as an image.
+        assert!(decode_data_uri("data:,%3Csvg%3E%3C/svg%3E").is_some());
+        assert!(decode_data_uri("data:text/plain,hello").is_none());
+
+        // Malformed or empty payloads are rejected.
+        assert!(decode_data_uri("data:image/png;base64,not valid base64!!!").is_none());
+        assert!(decode_data_uri("data:image/svg+xml,").is_none());
+        assert!(decode_data_uri("https://example.com/favicon.ico").is_none());
     }
 
     #[test]
