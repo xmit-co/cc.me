@@ -71,6 +71,9 @@ a {
   font-weight: 700;
   text-decoration: none;
 }
+.icon {
+  margin-right: 0.375em;
+}
 main {
   padding-block: 2.75em 4.5em;
 }
