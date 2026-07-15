@@ -110,7 +110,7 @@
           before. A proof of work rate-limits; it does not authenticate.
         </p>
         <p>
-          Choose levels from the attacker's hardware, not the visitor's: SHA-256 runs about 400×
+          Choose levels from the attacker's hardware, not the visitor's: SHA-256 runs 400–1,500×
           faster on one GPU than on one browser thread (see <a href="#solvers">below</a>), and
           Bitcoin ASICs are another five orders of magnitude beyond that.
         </p>
@@ -174,6 +174,18 @@ cc -O2 pow.c -lOpenCL -o pow-cl &amp;&amp; ./pow-cl solve 40 <span class="tok-st
           <dd>Metal, one kernel hashing one block per GPU thread — 377× one V8 thread, 28× all of them.</dd>
           <dt>2,031 MH/s</dt>
           <dd>OpenCL, the same kernel on the same GPU through Apple's legacy OpenCL.</dd>
+        </dl>
+        <p>
+          And on an AMD Ryzen 9 7950X3D (16 cores, 32 threads) with an NVIDIA GeForce RTX 4090,
+          same 10-second runs:
+        </p>
+        <dl>
+          <dt>3.5 MH/s</dt>
+          <dd>V8 (Node 24), one thread.</dd>
+          <dt>51 MH/s</dt>
+          <dd>V8, 32 worker threads.</dd>
+          <dt>5,146 MH/s</dt>
+          <dd>OpenCL on the RTX 4090 — 1,470× one V8 thread, 100× all of them.</dd>
         </dl>
       </section>
 
