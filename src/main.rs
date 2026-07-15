@@ -5054,7 +5054,15 @@ async fn spawn_chrome(config: &Config) -> Result<CdpClient, String> {
             "--disable-sync",
             "--disable-dev-shm-usage",
             "--force-color-profile=srgb",
+            // Crashpad insists on a writable database under $HOME; under a
+            // hardened unit (ReadOnlyDirectories=/) that kills Chrome before
+            // it publishes DevToolsActivePort.
+            "--disable-crash-reporter",
+            "--disable-breakpad",
         ])
+        // Chrome scribbles dotfiles wherever $HOME points; give it the
+        // profile dir we already clean up.
+        .env("HOME", &user_data_dir)
         .args(&config.shot_chrome_args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
