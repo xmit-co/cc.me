@@ -109,6 +109,9 @@ const DOCS_FONTS_HTML: &str = include_str!("../docs/fonts.html");
 const DOCS_POW_HTML: &str = include_str!("../docs/pow.html");
 const POW_JS: &str = include_str!("../docs/pow.js");
 const DOCS_SHOT_HTML: &str = include_str!("../docs/shot.html");
+const SITE_ICON_SVG: &str = include_str!("../docs/icon.svg");
+const SITE_TOUCH_ICON_PNG: &[u8] = include_bytes!("../docs/apple-touch-icon.png");
+const SITE_SOCIAL_PNG: &[u8] = include_bytes!("../docs/social.png");
 const SHOT_MAX_DIM: u32 = 2048;
 const SHOT_SETTLE_MS: u64 = 500;
 const SHOT_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
@@ -523,6 +526,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/pow.js", get(pow_js))
         .route("/shot", get(shot))
         .route("/shot/config", get(shot_config))
+        .route("/icon.svg", get(site_icon_svg))
+        .route("/apple-touch-icon.png", get(site_touch_icon))
+        .route("/social.png", get(site_social_image))
         .route(
             "/l/{id}",
             put(put_resource).get(get_resource).delete(delete_resource),
@@ -4751,6 +4757,40 @@ async fn pow_js() -> impl IntoResponse {
     )
 }
 
+// Site identity assets; regenerate the PNGs with bin/social.
+async fn site_icon_svg() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "image/svg+xml"),
+            (header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        SITE_ICON_SVG,
+    )
+}
+
+async fn site_touch_icon() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "image/png"),
+            (header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        SITE_TOUCH_ICON_PNG,
+    )
+}
+
+async fn site_social_image() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "image/png"),
+            (header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        SITE_SOCIAL_PNG,
+    )
+}
+
 // The published solving expectations: what the doc must contain is documented
 // on /shot; how much work it must carry is served here so clients can adapt.
 async fn shot_config(State(state): State<AppState>) -> impl IntoResponse {
@@ -5060,14 +5100,16 @@ async fn spawn_chrome(config: &Config) -> Result<CdpClient, String> {
             "--disable-crash-reporter",
             "--disable-breakpad",
         ])
-        // Chrome scribbles dotfiles wherever $HOME points; give it the
-        // profile dir we already clean up.
-        .env("HOME", &user_data_dir)
         .args(&config.shot_chrome_args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
+    // Crashpad also wants a writable $HOME even with reporting disabled; on
+    // macOS overriding HOME breaks Chrome's user-data-dir resolution (the
+    // DevToolsActivePort file lands elsewhere), so Linux only.
+    #[cfg(target_os = "linux")]
+    command.env("HOME", &user_data_dir);
     let child = command
         .spawn()
         .map_err(|err| format!("spawn {}: {err}", config.shot_chrome_bin))?;

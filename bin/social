@@ -1,0 +1,108 @@
+#!/usr/bin/env node
+// Regenerates the social preview and touch icon:
+//   docs/social.png            1200x630, from docs/social-card.html
+//   docs/apple-touch-icon.png  180x180,  from docs/icon.svg
+//
+// Drives headless Chrome over CDP (like the /shot service) because plain
+// `--headless --screenshot --window-size` paints a viewport shorter than the
+// window on macOS. Point CHROME at a Chromium binary if none is on PATH.
+import { spawn, execSync } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import process from "node:process";
+
+const root = resolve(dirname(new URL(import.meta.url).pathname), "..");
+
+function findChrome() {
+  if (process.env.CHROME) return process.env.CHROME;
+  for (const candidate of ["chromium", "google-chrome", "google-chrome-stable"]) {
+    try {
+      return execSync(`command -v ${candidate}`, { shell: "/bin/sh" }).toString().trim();
+    } catch {}
+  }
+  const mac = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+  if (existsSync(mac)) return mac;
+  console.error("no Chromium found; set CHROME");
+  process.exit(1);
+}
+
+const profile = mkdtempSync(join(tmpdir(), "social-"));
+const chrome = spawn(
+  findChrome(),
+  [
+    "--headless=new",
+    "--remote-debugging-port=0",
+    `--user-data-dir=${profile}`,
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--hide-scrollbars",
+    "--mute-audio",
+    "--disable-crash-reporter",
+    "--disable-breakpad",
+  ],
+  { stdio: "ignore" },
+);
+
+async function wsUrl() {
+  const portFile = join(profile, "DevToolsActivePort");
+  for (let i = 0; i < 100; i++) {
+    await new Promise((r) => setTimeout(r, 100));
+    try {
+      const [port, path] = readFileSync(portFile, "utf8").split("\n");
+      if (port && path) return `ws://127.0.0.1:${port}${path}`;
+    } catch {}
+  }
+  throw new Error("chrome did not publish DevToolsActivePort");
+}
+
+let nextId = 0;
+const pending = new Map();
+let ws;
+
+function call(method, params = {}, sessionId = undefined) {
+  const id = ++nextId;
+  ws.send(JSON.stringify({ id, method, params, sessionId }));
+  return new Promise((ok, fail) => pending.set(id, { ok, fail }));
+}
+
+async function render(url, width, height, out) {
+  const { targetId } = await call("Target.createTarget", { url: "about:blank" });
+  const { sessionId } = await call("Target.attachToTarget", { targetId, flatten: true });
+  await call("Page.enable", {}, sessionId);
+  await call(
+    "Emulation.setDeviceMetricsOverride",
+    { width, height, deviceScaleFactor: 1, mobile: false },
+    sessionId,
+  );
+  await call("Page.navigate", { url }, sessionId);
+  await new Promise((r) => setTimeout(r, 700)); // settle: layout, emoji fonts
+  const { data } = await call("Page.captureScreenshot", { format: "png" }, sessionId);
+  writeFileSync(out, Buffer.from(data, "base64"));
+  console.log(`${out}: ${width}x${height}`);
+  await call("Target.closeTarget", { targetId });
+}
+
+try {
+  ws = new WebSocket(await wsUrl());
+  ws.onmessage = (event) => {
+    const message = JSON.parse(event.data);
+    if (!message.id || !pending.has(message.id)) return;
+    const { ok, fail } = pending.get(message.id);
+    pending.delete(message.id);
+    if (message.error) fail(new Error(message.error.message));
+    else ok(message.result);
+  };
+  await new Promise((r, x) => ((ws.onopen = r), (ws.onerror = x)));
+
+  await render(`file://${root}/docs/social-card.html`, 1200, 630, join(root, "docs/social.png"));
+  // data: pages cannot load file: subresources, so inline the SVG too.
+  const svg = readFileSync(join(root, "docs/icon.svg")).toString("base64");
+  const icon = `<!doctype html><style>*{margin:0}</style><img src="data:image/svg+xml;base64,${svg}" width="180" height="180">`;
+  await render(`data:text/html,${encodeURIComponent(icon)}`, 180, 180, join(root, "docs/apple-touch-icon.png"));
+} finally {
+  const exited = new Promise((r) => chrome.once("exit", r));
+  chrome.kill();
+  await exited;
+  rmSync(profile, { recursive: true, force: true, maxRetries: 5 });
+}

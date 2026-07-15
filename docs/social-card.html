@@ -1,0 +1,46 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      * { margin: 0; box-sizing: border-box; }
+      html, body { width: 1200px; height: 630px; }
+      body {
+        position: relative;
+        padding: 64px 84px 56px;
+        background: #101114;
+        color: #eceff3;
+        font-family: system-ui, sans-serif;
+      }
+      .brand { font-size: 116px; font-weight: 700; letter-spacing: -0.02em; }
+      .brand .dot { color: #8ab4ff; }
+      .rule { height: 6px; width: 148px; background: #8ab4ff; border-radius: 3px; margin: 28px 0 44px; }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 30px 24px;
+      }
+      .item { display: flex; align-items: center; gap: 18px; font-size: 34px; color: #a9b0bb; }
+      .item .emoji { font-size: 40px; }
+      .foot { position: absolute; left: 84px; bottom: 44px; font-size: 26px; color: #8a919d; }
+    </style>
+  </head>
+  <body>
+    <div>
+      <div class="brand">cc<span class="dot">.</span>me</div>
+      <div class="rule"></div>
+      <div class="grid">
+        <div class="item"><span class="emoji">✉️</span> Email aliases</div>
+        <div class="item"><span class="emoji">↪️</span> OAuth callbacks</div>
+        <div class="item"><span class="emoji">📥</span> Sealed inboxes</div>
+        <div class="item"><span class="emoji">🔥</span> Burnable secrets</div>
+        <div class="item"><span class="emoji">🚦</span> Semaphores</div>
+        <div class="item"><span class="emoji">⭐</span> Favicons</div>
+        <div class="item"><span class="emoji">🔤</span> Fonts</div>
+        <div class="item"><span class="emoji">⛏️</span> Proof of work</div>
+        <div class="item"><span class="emoji">📸</span> Screenshots</div>
+      </div>
+    </div>
+    <div class="foot">By the xmit dev team — EU-hosted on renewable energy</div>
+  </body>
+</html>
