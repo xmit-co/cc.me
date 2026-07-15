@@ -499,3 +499,77 @@ input:disabled {
   color: var(--m);
   font-size: 0.875em;
 }
+
+/* proof of work (/pow) */
+.pow-form {
+  display: grid;
+  gap: 1em;
+  margin-top: 1em;
+}
+.pow-form label {
+  display: grid;
+  gap: 0.375em;
+  color: var(--f);
+  font-weight: 500;
+}
+.pow-form textarea,
+.pow-form input {
+  font: inherit;
+  padding: 0.625em 0.75em;
+  border: thin solid var(--l);
+  border-radius: 0.375em;
+  background: var(--b);
+  color: var(--f);
+}
+.pow-form textarea {
+  resize: vertical;
+  font-family: ui-monospace, monospace;
+  font-size: 0.875em;
+}
+.pow-form textarea:focus,
+.pow-form input:focus {
+  outline: none;
+  border-color: var(--a);
+}
+.pow-row {
+  display: flex;
+  align-items: end;
+  gap: 1em;
+}
+.pow-row label {
+  flex: 0 0 auto;
+}
+.pow-row input {
+  width: 6em;
+}
+.pow-result {
+  display: grid;
+  gap: 1em;
+  padding: 1em;
+  border: thin solid var(--l);
+  border-radius: 0.375em;
+  background: var(--c);
+}
+.pow-result input {
+  font-family: ui-monospace, monospace;
+  font-size: 0.875em;
+}
+#verify-out {
+  overflow-wrap: anywhere;
+  max-width: none;
+}
+#shot-img {
+  max-width: 100%;
+  border: thin solid var(--l);
+  border-radius: 0.375em;
+  background: #fff;
+}
+@media (max-width: 36em) {
+  .pow-row {
+    flex-wrap: wrap;
+  }
+  .pow-row button {
+    margin-top: 0;
+    width: auto;
+  }
+}

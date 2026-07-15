@@ -31,16 +31,19 @@ use curve25519_dalek::edwards::CompressedEdwardsY;
 #[cfg(test)]
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{
     PgPool, Row,
     postgres::{PgListener, PgPoolOptions},
 };
 use tokio::{
-    sync::{broadcast, mpsc},
+    sync::{broadcast, mpsc, oneshot},
     time::Instant,
 };
+use tokio_tungstenite::tungstenite::Message;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info};
 use url::{Url, form_urlencoded};
@@ -103,6 +106,14 @@ const ICON_MAX_REDIRECTS: usize = 5;
 const ICON_USER_AGENT: &str = "cc.me-favicon/1.0 (+https://cc.me/icon)";
 const MIGRATE_ADVISORY_LOCK: i64 = 0x6363_6d65; // "ccme"
 const DOCS_FONTS_HTML: &str = include_str!("../docs/fonts.html");
+const DOCS_POW_HTML: &str = include_str!("../docs/pow.html");
+const POW_JS: &str = include_str!("../docs/pow.js");
+const DOCS_SHOT_HTML: &str = include_str!("../docs/shot.html");
+const SHOT_MAX_DIM: u32 = 2048;
+const SHOT_SETTLE_MS: u64 = 500;
+const SHOT_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
+const SHOT_MAX_CONCURRENT: usize = 4;
+const SHOT_CHROME_START_TIMEOUT_SECONDS: u64 = 15;
 const FONTS_DEFAULT_DIR: &str = "/var/lib/fonts";
 // Google Fonts groups families by license directory.
 const FONTS_LICENSE_DIRS: [&str; 4] = ["ofl", "apache", "ufl", "cc-by-sa"];
@@ -128,6 +139,8 @@ struct AppState {
     stats_tx: mpsc::Sender<StatEvent>,
     http: reqwest::Client,
     fonts: Arc<RwLock<Arc<FontIndex>>>,
+    chrome: Arc<tokio::sync::Mutex<Option<CdpClient>>>,
+    shot_permits: Arc<tokio::sync::Semaphore>,
     config: Config,
 }
 
@@ -160,6 +173,12 @@ struct Config {
     secret_cleanup_interval_seconds: u64,
     fonts_dir: PathBuf,
     fonts_refresh_interval_seconds: u64,
+    shot_chrome_bin: String,
+    shot_chrome_args: Vec<String>,
+    shot_pow_level: u32,
+    shot_ts_window_seconds: i64,
+    shot_nav_timeout_seconds: f64,
+    shot_cache_seconds: f64,
 }
 
 #[derive(Debug)]
@@ -500,6 +519,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/fonts", get(fonts_search))
         .route("/fonts/{slug}", get(font_family))
         .route("/fonts/{slug}/{filename}", get(font_file))
+        .route("/pow", get(pow_docs))
+        .route("/pow.js", get(pow_js))
+        .route("/shot", get(shot))
+        .route("/shot/config", get(shot_config))
         .route(
             "/l/{id}",
             put(put_resource).get(get_resource).delete(delete_resource),
@@ -554,6 +577,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             stats_tx,
             http,
             fonts,
+            chrome: Arc::new(tokio::sync::Mutex::new(None)),
+            shot_permits: Arc::new(tokio::sync::Semaphore::new(SHOT_MAX_CONCURRENT)),
             config: config.clone(),
         });
 
@@ -956,6 +981,18 @@ async fn run_migrations(db: &PgPool) -> Result<(), sqlx::Error> {
     .execute(db)
     .await?;
 
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS shot_cache (
+            key        text PRIMARY KEY,
+            bytes      bytea NOT NULL,
+            created_at timestamptz NOT NULL DEFAULT now()
+        )
+        "#,
+    )
+    .execute(db)
+    .await?;
+
     Ok(())
 }
 
@@ -1001,6 +1038,10 @@ async fn http_docs() -> Response {
 
 async fn library_docs() -> Response {
     docs_html(DOCS_LIB_HTML)
+}
+
+async fn pow_docs() -> Response {
+    docs_html(DOCS_POW_HTML)
 }
 
 // Favicon proxy. `GET /icon?url=<url>` returns the site's favicon bytes with a
@@ -4630,6 +4671,16 @@ impl Config {
                 "FONTS_REFRESH_INTERVAL_SECONDS",
                 FONTS_REFRESH_INTERVAL_SECONDS,
             ),
+            shot_chrome_bin: env::var("SHOT_CHROME_BIN").unwrap_or_else(|_| "chromium".to_owned()),
+            shot_chrome_args: env::var("SHOT_CHROME_ARGS")
+                .map(|args| args.split_whitespace().map(str::to_owned).collect())
+                .unwrap_or_default(),
+            // Default sized for GPUs: ~17M hashes is a few milliseconds on one
+            // (see pow/README.md), seconds for browser workers.
+            shot_pow_level: env_u64("SHOT_POW_LEVEL", 24).clamp(1, 64) as u32,
+            shot_ts_window_seconds: env_u64("SHOT_TS_WINDOW_SECONDS", 300).max(1) as i64,
+            shot_nav_timeout_seconds: env_f64("SHOT_NAV_TIMEOUT_SECONDS", 10.0).max(1.0),
+            shot_cache_seconds: env_f64("SHOT_CACHE_SECONDS", 3600.0).max(1.0),
         })
     }
 }
@@ -4679,6 +4730,602 @@ fn env_f64(name: &str, default: f64) -> f64 {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(default)
+}
+
+// ---- screenshots (/shot) ----------------------------------------------------
+//
+// `GET /shot?token=<pow token>` renders a page in a managed headless Chrome and
+// returns a PNG. The proof-of-work document (see /pow) is a JSON spec binding
+// the URL, viewport, downscale factor, and a fresh timestamp; results are
+// cached in Postgres. Every render happens in its own ephemeral browser
+// context (incognito equivalent), disposed afterwards.
+
+async fn pow_js() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "public, max-age=300"),
+        ],
+        POW_JS,
+    )
+}
+
+// The published solving expectations: what the doc must contain is documented
+// on /shot; how much work it must carry is served here so clients can adapt.
+async fn shot_config(State(state): State<AppState>) -> impl IntoResponse {
+    Json(json!({
+        "level": state.config.shot_pow_level,
+        "ts_window_seconds": state.config.shot_ts_window_seconds,
+        "max_dimension": SHOT_MAX_DIM,
+        "cache_seconds": state.config.shot_cache_seconds,
+    }))
+}
+
+fn pow_trailing_zero_bits(digest: &[u8]) -> u32 {
+    let mut bits = 0;
+    for byte in digest.iter().rev() {
+        if *byte == 0 {
+            bits += 8;
+        } else {
+            bits += byte.trailing_zeros();
+            break;
+        }
+    }
+    bits
+}
+
+// Splits and checks a `b64u(doc).b64u(suffix)` token, returning the doc and
+// the level it reaches. The base64 engine rejects padding and non-canonical
+// trailing bits, matching the spec on /pow.
+fn pow_token_doc_and_level(token: &str) -> AppResult<(Vec<u8>, u32)> {
+    let Some((doc_b64, suffix_b64)) = token.split_once('.') else {
+        return Err(AppError::new(
+            StatusCode::BAD_REQUEST,
+            "token must be b64u(doc).b64u(suffix)",
+        ));
+    };
+    let invalid = |_| AppError::new(StatusCode::BAD_REQUEST, "token segments must be canonical unpadded base64url");
+    let doc = URL_SAFE_NO_PAD.decode(doc_b64).map_err(invalid)?;
+    let suffix = URL_SAFE_NO_PAD.decode(suffix_b64).map_err(invalid)?;
+    if suffix.len() > 32 {
+        return Err(AppError::new(
+            StatusCode::BAD_REQUEST,
+            "suffix longer than 32 bytes",
+        ));
+    }
+    let inner = Sha256::digest(&doc);
+    let mut outer = Sha256::new();
+    outer.update(inner);
+    outer.update(&suffix);
+    let level = pow_trailing_zero_bits(&outer.finalize());
+    Ok((doc, level))
+}
+
+fn shot_default_scale() -> f64 {
+    1.0
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ShotSpec {
+    url: String,
+    width: u32,
+    height: u32,
+    #[serde(default = "shot_default_scale")]
+    scale: f64,
+    ts: i64,
+}
+
+impl ShotSpec {
+    fn validate(&self, config: &Config) -> AppResult<()> {
+        if !(1..=SHOT_MAX_DIM).contains(&self.width) || !(1..=SHOT_MAX_DIM).contains(&self.height) {
+            return Err(AppError::new(
+                StatusCode::BAD_REQUEST,
+                format!("width and height must be 1..={SHOT_MAX_DIM}"),
+            ));
+        }
+        if !(self.scale > 0.0 && self.scale <= 1.0) {
+            return Err(AppError::new(
+                StatusCode::BAD_REQUEST,
+                "scale must be in (0, 1]",
+            ));
+        }
+        if self.width as f64 * self.scale < 1.0 || self.height as f64 * self.scale < 1.0 {
+            return Err(AppError::new(
+                StatusCode::BAD_REQUEST,
+                "scaled size is below one pixel",
+            ));
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(internal)?
+            .as_secs() as i64;
+        if (now - self.ts).abs() > config.shot_ts_window_seconds {
+            return Err(AppError::new(
+                StatusCode::BAD_REQUEST,
+                format!("ts must be within {} seconds of now", config.shot_ts_window_seconds),
+            ));
+        }
+        Ok(())
+    }
+
+    // `ts` is deliberately absent: retries with a fresh timestamp share the
+    // cache entry for an otherwise identical request.
+    fn cache_key(&self) -> String {
+        let digest = Sha256::digest(format!(
+            "{}\n{}\n{}\n{}",
+            self.url, self.width, self.height, self.scale
+        ));
+        URL_SAFE_NO_PAD.encode(digest)
+    }
+}
+
+// Chrome resolves hostnames itself, so unlike the favicon fetcher we cannot
+// filter addresses at connect time; refuse names with any non-public address
+// up front instead.
+async fn shot_check_url(url_text: &str) -> AppResult<()> {
+    let parsed = Url::parse(url_text)
+        .map_err(|_| AppError::new(StatusCode::BAD_REQUEST, "url is invalid"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(AppError::new(
+            StatusCode::BAD_REQUEST,
+            "url must be http or https",
+        ));
+    }
+    let not_allowed = || AppError::new(StatusCode::BAD_REQUEST, "url host is not allowed");
+    match parsed.host() {
+        Some(url::Host::Ipv4(ip)) if ip_is_forbidden(&IpAddr::V4(ip)) => Err(not_allowed()),
+        Some(url::Host::Ipv6(ip)) if ip_is_forbidden(&IpAddr::V6(ip)) => Err(not_allowed()),
+        Some(url::Host::Domain(domain)) => {
+            let host = domain.to_owned();
+            let port = parsed.port_or_known_default().unwrap_or(443);
+            let addrs = tokio::task::spawn_blocking(move || {
+                (host.as_str(), port)
+                    .to_socket_addrs()
+                    .map(|addrs| addrs.collect::<Vec<_>>())
+                    .unwrap_or_default()
+            })
+            .await
+            .map_err(internal)?;
+            if addrs.is_empty() {
+                return Err(AppError::new(
+                    StatusCode::BAD_GATEWAY,
+                    "url host did not resolve",
+                ));
+            }
+            if addrs.iter().any(|addr| ip_is_forbidden(&addr.ip())) {
+                return Err(not_allowed());
+            }
+            Ok(())
+        }
+        Some(_) => Ok(()),
+        None => Err(AppError::new(StatusCode::BAD_REQUEST, "url has no host")),
+    }
+}
+
+// A handle to the managed Chrome's CDP connection. Cloning shares the
+// connection; when the actor exits (Chrome died) the channel closes and the
+// next request respawns the browser.
+#[derive(Clone)]
+struct CdpClient {
+    tx: mpsc::Sender<CdpRequest>,
+}
+
+enum CdpRequest {
+    Call {
+        session_id: Option<String>,
+        method: String,
+        params: Value,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    WaitEvent {
+        session_id: String,
+        method: String,
+        reply: oneshot::Sender<()>,
+    },
+}
+
+impl CdpClient {
+    async fn call(&self, session_id: Option<&str>, method: &str, params: Value) -> Result<Value, String> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(CdpRequest::Call {
+                session_id: session_id.map(str::to_owned),
+                method: method.to_owned(),
+                params,
+                reply,
+            })
+            .await
+            .map_err(|_| "chrome connection closed".to_owned())?;
+        match tokio::time::timeout(Duration::from_secs(30), rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err("chrome connection closed".to_owned()),
+            Err(_) => Err(format!("{method} timed out")),
+        }
+    }
+
+    // Registers interest in a session event; register before triggering it.
+    async fn wait_event(&self, session_id: &str, method: &str) -> Result<oneshot::Receiver<()>, String> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(CdpRequest::WaitEvent {
+                session_id: session_id.to_owned(),
+                method: method.to_owned(),
+                reply,
+            })
+            .await
+            .map_err(|_| "chrome connection closed".to_owned())?;
+        Ok(rx)
+    }
+}
+
+// Owns the websocket: multiplexes calls by id, fans events out to waiters.
+async fn cdp_actor(
+    ws: tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    mut rx: mpsc::Receiver<CdpRequest>,
+    mut child: tokio::process::Child,
+    user_data_dir: PathBuf,
+) {
+    let (mut sink, mut stream) = ws.split();
+    let mut next_id: u64 = 1;
+    let mut pending: HashMap<u64, oneshot::Sender<Result<Value, String>>> = HashMap::new();
+    let mut waiters: Vec<(String, String, oneshot::Sender<()>)> = Vec::new();
+    loop {
+        tokio::select! {
+            request = rx.recv() => match request {
+                None => break,
+                Some(CdpRequest::Call { session_id, method, params, reply }) => {
+                    let id = next_id;
+                    next_id += 1;
+                    let mut message = json!({ "id": id, "method": method, "params": params });
+                    if let Some(session_id) = session_id {
+                        message["sessionId"] = session_id.into();
+                    }
+                    if sink.send(Message::Text(message.to_string().into())).await.is_err() {
+                        let _ = reply.send(Err("chrome connection closed".to_owned()));
+                        break;
+                    }
+                    pending.insert(id, reply);
+                }
+                Some(CdpRequest::WaitEvent { session_id, method, reply }) => {
+                    waiters.push((session_id, method, reply));
+                }
+            },
+            message = stream.next() => match message {
+                Some(Ok(Message::Text(text))) => {
+                    let Ok(value) = serde_json::from_str::<Value>(text.as_str()) else {
+                        continue;
+                    };
+                    if let Some(id) = value.get("id").and_then(Value::as_u64) {
+                        if let Some(reply) = pending.remove(&id) {
+                            let result = match value.get("error") {
+                                Some(error) => Err(error
+                                    .get("message")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("CDP error")
+                                    .to_owned()),
+                                None => Ok(value.get("result").cloned().unwrap_or(Value::Null)),
+                            };
+                            let _ = reply.send(result);
+                        }
+                    } else if let (Some(method), Some(session_id)) = (
+                        value.get("method").and_then(Value::as_str),
+                        value.get("sessionId").and_then(Value::as_str),
+                    ) {
+                        let mut i = 0;
+                        while i < waiters.len() {
+                            if waiters[i].0 == session_id && waiters[i].1 == method {
+                                let (_, _, reply) = waiters.swap_remove(i);
+                                let _ = reply.send(());
+                            } else {
+                                i += 1;
+                            }
+                        }
+                    }
+                }
+                Some(Ok(_)) => {}
+                _ => break,
+            },
+        }
+    }
+    let _ = child.kill().await;
+    let _ = tokio::fs::remove_dir_all(&user_data_dir).await;
+    info!("chrome for screenshots exited");
+}
+
+async fn spawn_chrome(config: &Config) -> Result<CdpClient, String> {
+    let user_data_dir = env::temp_dir().join(format!("cc-me-shot-{}", Uuid::new_v4()));
+    tokio::fs::create_dir_all(&user_data_dir)
+        .await
+        .map_err(|err| format!("create profile dir: {err}"))?;
+    let mut command = tokio::process::Command::new(&config.shot_chrome_bin);
+    command
+        .arg("--headless=new")
+        .arg("--remote-debugging-port=0")
+        .arg(format!("--user-data-dir={}", user_data_dir.display()))
+        .args([
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--hide-scrollbars",
+            "--mute-audio",
+            "--disable-background-networking",
+            "--disable-extensions",
+            "--disable-sync",
+            "--disable-dev-shm-usage",
+            "--force-color-profile=srgb",
+        ])
+        .args(&config.shot_chrome_args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let child = command
+        .spawn()
+        .map_err(|err| format!("spawn {}: {err}", config.shot_chrome_bin))?;
+    // Chrome publishes its ephemeral CDP endpoint in the profile directory.
+    let port_file = user_data_dir.join("DevToolsActivePort");
+    let mut ws_url = None;
+    for _ in 0..SHOT_CHROME_START_TIMEOUT_SECONDS * 10 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if let Ok(contents) = tokio::fs::read_to_string(&port_file).await {
+            let mut lines = contents.lines();
+            if let (Some(port), Some(path)) = (lines.next(), lines.next()) {
+                ws_url = Some(format!("ws://127.0.0.1:{port}{path}"));
+                break;
+            }
+        }
+    }
+    let Some(ws_url) = ws_url else {
+        return Err("chrome did not publish DevToolsActivePort".to_owned());
+    };
+    let (ws, _) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .map_err(|err| format!("connect to chrome: {err}"))?;
+    let (tx, rx) = mpsc::channel(64);
+    tokio::spawn(cdp_actor(ws, rx, child, user_data_dir));
+    info!("chrome ready for screenshots");
+    Ok(CdpClient { tx })
+}
+
+async fn chrome_client(state: &AppState) -> AppResult<CdpClient> {
+    let mut guard = state.chrome.lock().await;
+    if let Some(client) = guard.as_ref() {
+        if !client.tx.is_closed() {
+            return Ok(client.clone());
+        }
+    }
+    let client = spawn_chrome(&state.config).await.map_err(|err| {
+        error!(%err, "chrome spawn failed");
+        AppError::new(StatusCode::SERVICE_UNAVAILABLE, "screenshot backend unavailable")
+    })?;
+    *guard = Some(client.clone());
+    Ok(client)
+}
+
+fn shot_backend_error(err: String) -> AppError {
+    error!(%err, "screenshot backend error");
+    AppError::new(StatusCode::SERVICE_UNAVAILABLE, "screenshot backend unavailable")
+}
+
+async fn shot_render(client: &CdpClient, spec: &ShotSpec, nav_timeout: Duration) -> AppResult<Vec<u8>> {
+    let context = client
+        .call(None, "Target.createBrowserContext", json!({}))
+        .await
+        .map_err(shot_backend_error)?;
+    let Some(context_id) = context.get("browserContextId").and_then(Value::as_str) else {
+        return Err(shot_backend_error("no browserContextId".to_owned()));
+    };
+    let context_id = context_id.to_owned();
+    let result = shot_render_in_context(client, &context_id, spec, nav_timeout).await;
+    // Disposing the context closes its targets and drops all its state.
+    let _ = client
+        .call(
+            None,
+            "Target.disposeBrowserContext",
+            json!({ "browserContextId": context_id }),
+        )
+        .await;
+    result
+}
+
+async fn shot_render_in_context(
+    client: &CdpClient,
+    context_id: &str,
+    spec: &ShotSpec,
+    nav_timeout: Duration,
+) -> AppResult<Vec<u8>> {
+    let target = client
+        .call(
+            None,
+            "Target.createTarget",
+            json!({ "url": "about:blank", "browserContextId": context_id }),
+        )
+        .await
+        .map_err(shot_backend_error)?;
+    let Some(target_id) = target.get("targetId").and_then(Value::as_str) else {
+        return Err(shot_backend_error("no targetId".to_owned()));
+    };
+    let attached = client
+        .call(
+            None,
+            "Target.attachToTarget",
+            json!({ "targetId": target_id, "flatten": true }),
+        )
+        .await
+        .map_err(shot_backend_error)?;
+    let Some(session) = attached.get("sessionId").and_then(Value::as_str) else {
+        return Err(shot_backend_error("no sessionId".to_owned()));
+    };
+    client
+        .call(Some(session), "Page.enable", json!({}))
+        .await
+        .map_err(shot_backend_error)?;
+    // deviceScaleFactor is where the downscaling happens: the PNG comes out at
+    // width×scale by height×scale device pixels.
+    client
+        .call(
+            Some(session),
+            "Emulation.setDeviceMetricsOverride",
+            json!({
+                "width": spec.width,
+                "height": spec.height,
+                "deviceScaleFactor": spec.scale,
+                "mobile": false,
+            }),
+        )
+        .await
+        .map_err(shot_backend_error)?;
+    let loaded = client
+        .wait_event(session, "Page.loadEventFired")
+        .await
+        .map_err(shot_backend_error)?;
+    let navigation = client
+        .call(Some(session), "Page.navigate", json!({ "url": spec.url }))
+        .await
+        .map_err(shot_backend_error)?;
+    if let Some(error_text) = navigation.get("errorText").and_then(Value::as_str) {
+        if !error_text.is_empty() {
+            return Err(AppError::new(
+                StatusCode::BAD_GATEWAY,
+                format!("navigation failed: {error_text}"),
+            ));
+        }
+    }
+    match tokio::time::timeout(nav_timeout, loaded).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => return Err(shot_backend_error("chrome connection closed".to_owned())),
+        Err(_) => {
+            return Err(AppError::new(
+                StatusCode::GATEWAY_TIMEOUT,
+                "page did not finish loading in time",
+            ));
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(SHOT_SETTLE_MS)).await;
+    let screenshot = client
+        .call(Some(session), "Page.captureScreenshot", json!({ "format": "png" }))
+        .await
+        .map_err(shot_backend_error)?;
+    let Some(data) = screenshot.get("data").and_then(Value::as_str) else {
+        return Err(shot_backend_error("no screenshot data".to_owned()));
+    };
+    general_purpose::STANDARD
+        .decode(data)
+        .map_err(|_| shot_backend_error("undecodable screenshot data".to_owned()))
+}
+
+async fn shot_cache_lookup(state: &AppState, key: &str) -> AppResult<Option<Vec<u8>>> {
+    let row = sqlx::query(
+        "SELECT bytes FROM shot_cache WHERE key = $1 AND created_at > now() - make_interval(secs => $2)",
+    )
+    .bind(key)
+    .bind(state.config.shot_cache_seconds)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(internal)?;
+    Ok(row.map(|row| row.get("bytes")))
+}
+
+async fn shot_cache_store(state: &AppState, key: &str, bytes: &[u8]) -> AppResult<()> {
+    if bytes.len() > SHOT_CACHE_MAX_BYTES {
+        return Ok(());
+    }
+    sqlx::query(
+        r#"
+        INSERT INTO shot_cache (key, bytes) VALUES ($1, $2)
+        ON CONFLICT (key) DO UPDATE SET bytes = EXCLUDED.bytes, created_at = now()
+        "#,
+    )
+    .bind(key)
+    .bind(bytes)
+    .execute(&state.db)
+    .await
+    .map_err(internal)?;
+    // Opportunistic cleanup; renders are PoW-limited so this stays cheap.
+    let _ = sqlx::query("DELETE FROM shot_cache WHERE created_at < now() - make_interval(secs => $1)")
+        .bind(state.config.shot_cache_seconds * 2.0)
+        .execute(&state.db)
+        .await;
+    Ok(())
+}
+
+fn shot_png_response(bytes: Vec<u8>, cache_hit: bool) -> Response {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "image/png"),
+            (header::CACHE_CONTROL, "public, max-age=3600"),
+            (
+                header::HeaderName::from_static("x-cache"),
+                if cache_hit { "hit" } else { "miss" },
+            ),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+async fn shot(State(state): State<AppState>, RawQuery(raw_query): RawQuery) -> AppResult<Response> {
+    let token = raw_query.as_deref().and_then(|query| {
+        form_urlencoded::parse(query.as_bytes())
+            .find(|(key, _)| key == "token")
+            .map(|(_, value)| value.into_owned())
+    });
+    let Some(token) = token else {
+        return Ok(docs_html(DOCS_SHOT_HTML));
+    };
+
+    let (doc, level) = pow_token_doc_and_level(&token)?;
+    if level < state.config.shot_pow_level {
+        return Err(AppError::new(
+            StatusCode::FORBIDDEN,
+            format!(
+                "proof of work reaches level {level}, {} required",
+                state.config.shot_pow_level
+            ),
+        ));
+    }
+    let spec: ShotSpec = serde_json::from_slice(&doc).map_err(|err| {
+        AppError::new(StatusCode::BAD_REQUEST, format!("doc is not a valid spec: {err}"))
+    })?;
+    spec.validate(&state.config)?;
+    shot_check_url(&spec.url).await?;
+
+    let key = spec.cache_key();
+    if let Some(bytes) = shot_cache_lookup(&state, &key).await? {
+        return Ok(shot_png_response(bytes, true));
+    }
+
+    let _permit = state
+        .shot_permits
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(internal)?;
+    // A queued identical request may have been rendered while we waited.
+    if let Some(bytes) = shot_cache_lookup(&state, &key).await? {
+        return Ok(shot_png_response(bytes, true));
+    }
+
+    let client = chrome_client(&state).await?;
+    let nav_timeout = Duration::from_secs_f64(state.config.shot_nav_timeout_seconds);
+    let png = match tokio::time::timeout(
+        nav_timeout + Duration::from_secs(20),
+        shot_render(&client, &spec, nav_timeout),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => {
+            return Err(AppError::new(
+                StatusCode::GATEWAY_TIMEOUT,
+                "render timed out",
+            ));
+        }
+    };
+    shot_cache_store(&state, &key, &png).await?;
+    Ok(shot_png_response(png, false))
 }
 
 #[cfg(test)]
@@ -5273,6 +5920,12 @@ mod tests {
             secret_cleanup_interval_seconds: 60,
             fonts_dir: PathBuf::from("/var/lib/fonts"),
             fonts_refresh_interval_seconds: 0,
+            shot_chrome_bin: "chromium".to_owned(),
+            shot_chrome_args: Vec::new(),
+            shot_pow_level: 24,
+            shot_ts_window_seconds: 300,
+            shot_nav_timeout_seconds: 10.0,
+            shot_cache_seconds: 3600.0,
         }
     }
 
@@ -5312,6 +5965,12 @@ mod tests {
             secret_cleanup_interval_seconds: 60,
             fonts_dir: PathBuf::from("/var/lib/fonts"),
             fonts_refresh_interval_seconds: 0,
+            shot_chrome_bin: "chromium".to_owned(),
+            shot_chrome_args: Vec::new(),
+            shot_pow_level: 24,
+            shot_ts_window_seconds: 300,
+            shot_nav_timeout_seconds: 10.0,
+            shot_cache_seconds: 3600.0,
         };
 
         let router = Router::new()
@@ -5328,6 +5987,8 @@ mod tests {
                 stats_tx,
                 http: build_http_client(),
                 fonts: Arc::new(RwLock::new(Arc::new(FontIndex::empty()))),
+                chrome: Arc::new(tokio::sync::Mutex::new(None)),
+                shot_permits: Arc::new(tokio::sync::Semaphore::new(SHOT_MAX_CONCURRENT)),
                 config,
             });
 
@@ -6191,6 +6852,68 @@ mod tests {
     }
 
     #[test]
+    fn pow_token_parsing_and_level() {
+        // Level-20 example token from the /pow docs.
+        let (doc, level) = pow_token_doc_and_level("aGVsbG8gd29ybGQ.XBCKI7lQ3i4").unwrap();
+        assert_eq!(doc, b"hello world");
+        assert_eq!(level, 20);
+
+        // Empty doc and suffix are well-formed (and reach whatever they reach).
+        let (doc, _) = pow_token_doc_and_level(".").unwrap();
+        assert!(doc.is_empty());
+
+        assert!(pow_token_doc_and_level("nodot").is_err());
+        assert!(pow_token_doc_and_level("aGVsbG8=.AAAA").is_err(), "padding");
+        assert!(pow_token_doc_and_level("aGVsbG8gd29ybGR.AAAA").is_err(), "trailing bits");
+        let long_suffix = format!("aGVsbG8.{}", "A".repeat(60));
+        assert!(pow_token_doc_and_level(&long_suffix).is_err(), "suffix > 32 bytes");
+    }
+
+    #[test]
+    fn shot_spec_validation_and_cache_key() {
+        let config = test_secret_config();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let spec = |width, height, scale, ts| ShotSpec {
+            url: "https://example.com/".to_owned(),
+            width,
+            height,
+            scale,
+            ts,
+        };
+
+        assert!(spec(800, 600, 0.5, now).validate(&config).is_ok());
+        assert!(spec(2048, 2048, 1.0, now).validate(&config).is_ok());
+        assert!(spec(2049, 600, 1.0, now).validate(&config).is_err(), "too wide");
+        assert!(spec(800, 0, 1.0, now).validate(&config).is_err(), "zero height");
+        assert!(spec(800, 600, 0.0, now).validate(&config).is_err(), "zero scale");
+        assert!(spec(800, 600, 1.5, now).validate(&config).is_err(), "upscale");
+        assert!(spec(1, 1, 0.1, now).validate(&config).is_err(), "sub-pixel output");
+        assert!(spec(800, 600, 1.0, now - 3600).validate(&config).is_err(), "stale ts");
+        assert!(spec(800, 600, 1.0, now + 3600).validate(&config).is_err(), "future ts");
+
+        // The cache key covers everything but ts.
+        assert_eq!(spec(800, 600, 0.5, now).cache_key(), spec(800, 600, 0.5, 0).cache_key());
+        assert_ne!(spec(800, 600, 0.5, now).cache_key(), spec(800, 601, 0.5, now).cache_key());
+
+        // Unknown fields are rejected: the doc must be exactly the spec.
+        assert!(
+            serde_json::from_str::<ShotSpec>(
+                r#"{"url":"https://example.com/","width":1,"height":1,"ts":0,"extra":1}"#
+            )
+            .is_err()
+        );
+        // scale is optional and defaults to 1.
+        let parsed: ShotSpec = serde_json::from_str(
+            r#"{"url":"https://example.com/","width":1,"height":1,"ts":0}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.scale, 1.0);
+    }
+
+    #[test]
     fn extract_icon_hrefs_uses_a_real_parser() {
         let html = r#"
             <html><head>
@@ -6367,6 +7090,12 @@ axes {
             secret_cleanup_interval_seconds: 60,
             fonts_dir: PathBuf::from("/var/lib/fonts"),
             fonts_refresh_interval_seconds: 0,
+            shot_chrome_bin: "chromium".to_owned(),
+            shot_chrome_args: Vec::new(),
+            shot_pow_level: 24,
+            shot_ts_window_seconds: 300,
+            shot_nav_timeout_seconds: 10.0,
+            shot_cache_seconds: 3600.0,
         };
         Router::new()
             .route("/fonts", get(fonts_search))
@@ -6379,6 +7108,8 @@ axes {
                 stats_tx,
                 http: build_http_client(),
                 fonts: Arc::new(RwLock::new(Arc::new(fonts))),
+                chrome: Arc::new(tokio::sync::Mutex::new(None)),
+                shot_permits: Arc::new(tokio::sync::Semaphore::new(SHOT_MAX_CONCURRENT)),
                 config,
             })
     }

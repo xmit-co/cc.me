@@ -1,0 +1,17 @@
+# Builds the proof-of-work solvers. Run ./configure once first; it writes
+# config.ninja (compilers, flags) and defaults.ninja (platform targets —
+# Metal is macOS-only).
+include config.ninja
+
+rule cc
+  command = $cc -O2 -Wall -Wextra $in $clldflags -o $out
+  description = cc $out
+
+rule swiftc
+  command = $swiftc -O $in -o $out
+  description = swiftc $out
+
+build pow-cl: cc pow.c
+build pow: swiftc pow.swift
+
+include defaults.ninja

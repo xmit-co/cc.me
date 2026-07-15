@@ -2,6 +2,13 @@
 *.pyc
 /.direnv/
 /.pgdata/
+/.pgsock/
 /fonts/
 node_modules/
 target/
+/pow/pow
+/pow/pow-cl
+/pow/config.ninja
+/pow/.ninja_log
+/pow/.ninja_deps
+/pow/defaults.ninja

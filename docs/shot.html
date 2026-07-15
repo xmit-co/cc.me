@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>cc.me docs — Screenshots</title>
+    <meta
+      name="description"
+      content="Screenshot any page in a fresh headless-Chrome context, paid for with proof of work."
+    />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="go-import" content="cc.me git https://github.com/xmit-co/cc.me" />
+    <meta
+      name="go-source"
+      content="cc.me https://github.com/xmit-co/cc.me https://github.com/xmit-co/cc.me/tree/main{/dir} https://github.com/xmit-co/cc.me/blob/main{/dir}/{file}#L{line}"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header>
+      <span class="brand"><a href="/">cc.me</a> / Screenshots</span>
+      <nav aria-label="Sections">
+        <a href="#request">Request</a>
+        <a href="#document">Document</a>
+        <a href="#try">Try it</a>
+        <a href="#errors">Errors</a>
+      </nav>
+    </header>
+
+    <main>
+      <section class="intro">
+        <h1>Screenshots.</h1>
+        <p>
+          Render any page in a managed headless Chrome and get a PNG back. Every render happens in
+          a fresh, incognito-style browser context that is disposed afterwards, and every request
+          is paid for with a <a href="/pow">proof-of-work</a> token — no accounts, no API keys.
+          Results are cached for an hour.
+        </p>
+      </section>
+
+      <section id="request">
+        <h2>Request</h2>
+        <p>
+          <code>GET /shot?token=&lt;token&gt;</code> where the token is a proof of work over the
+          request document described below. The response is <code>image/png</code>; an
+          <code>x-cache: hit</code> header marks answers served from the hour-long cache.
+          <code>GET /shot/config</code> returns the required level as JSON, currently as
+          <code>{"level": …}</code>.
+        </p>
+        <pre><code><span class="tok-method">GET</span> <span class="tok-path">/shot</span><span class="tok-query">?token=eyJ1cmwiOiJodHRwczovL2V4YW1wbGUuY29tLyIsIndpZHRoIjo4MDAsImhlaWdodCI6NjAwLCJzY2FsZSI6MC41LCJ0cyI6MTc1MjYwMDAwMH0.AAAmB0i-4vE</span></code></pre>
+      </section>
+
+      <section id="document">
+        <h2>Document</h2>
+        <p>
+          The proof-of-work document is a JSON object with exactly these fields (no extras, any
+          order):
+        </p>
+        <dl>
+          <dt><code>url</code></dt>
+          <dd><code>http</code> or <code>https</code> page to render. Non-public addresses are refused.</dd>
+          <dt><code>width</code>, <code>height</code></dt>
+          <dd>Render viewport in CSS pixels, integers from 1 to 2048 each.</dd>
+          <dt><code>scale</code></dt>
+          <dd>
+            Optional downscale factor in (0, 1], default 1. The PNG comes back at
+            <code>width×scale</code> by <code>height×scale</code> pixels; Chrome does the scaling.
+          </dd>
+          <dt><code>ts</code></dt>
+          <dd>
+            Current Unix time in seconds. Accepted within 5 minutes either way, so tokens cannot be
+            stockpiled.
+          </dd>
+        </dl>
+        <p>
+          Solve to the level from <code>/shot/config</code> — default 24, sized so a GPU pays a few
+          milliseconds and browser workers a few seconds — with any solver from the
+          <a href="/pow#solvers">proof-of-work page</a>:
+        </p>
+        <pre><code>doc=$(jq -nc --arg url https://example.com/ \
+  '{url: $url, width: 800, height: 600, scale: 0.5, ts: now | floor}')
+curl -sG https://cc.me/shot --data-urlencode "token=$(node pow.mjs solve 24 "$doc")" -o shot.png</code></pre>
+        <p>
+          Identical documents (ignoring <code>ts</code>) hit the same cache entry, so retrying
+          within the hour is free for the server and instant for you.
+        </p>
+      </section>
+
+      <section id="try">
+        <h2>Try it</h2>
+        <p>
+          Solves the proof of work in this page with Web Workers, then requests the screenshot.
+        </p>
+        <noscript><p class="status error">JavaScript is required for the demo.</p></noscript>
+        <div class="pow-form">
+          <label>URL <input id="url" type="url" value="https://example.com/" /></label>
+          <div class="pow-row">
+            <label>Width <input id="width" type="number" min="1" max="2048" value="1024" /></label>
+            <label>Height <input id="height" type="number" min="1" max="2048" value="768" /></label>
+            <label>Scale <input id="scale" type="number" min="0.05" max="1" step="0.05" value="0.5" /></label>
+            <button id="shot-btn" type="button">Screenshot</button>
+          </div>
+          <p id="shot-status" class="note hidden"></p>
+          <div id="shot-result" class="pow-result hidden">
+            <img id="shot-img" alt="Rendered screenshot" />
+            <span id="shot-meta" class="note"></span>
+          </div>
+        </div>
+      </section>
+
+      <section id="errors">
+        <h2>Errors</h2>
+        <dl>
+          <dt><code>400</code></dt>
+          <dd>Malformed token or document, out-of-range size or scale, stale <code>ts</code>, or a URL pointing at a non-public address.</dd>
+          <dt><code>403</code></dt>
+          <dd>Proof of work below the required level.</dd>
+          <dt><code>502</code></dt>
+          <dd>The page failed to load (DNS, TLS, connection refused…).</dd>
+          <dt><code>503</code></dt>
+          <dd>The managed Chrome is unavailable.</dd>
+          <dt><code>504</code></dt>
+          <dd>The page did not finish loading in time.</dd>
+        </dl>
+      </section>
+
+      <footer>
+        By <a href="https://xmit.dev/">xmit dev team</a>. Screenshots are rendered in disposable
+        contexts and cached for one hour; we keep no other record of them.
+      </footer>
+    </main>
+
+    <script src="./pow.js"></script>
+    <script>
+      "use strict";
+
+      const $ = (id) => document.getElementById(id);
+      const status = $("shot-status");
+      let running = null;
+
+      $("shot-btn").addEventListener("click", async () => {
+        if (running) {
+          running.stop();
+          running = null;
+          $("shot-btn").textContent = "Screenshot";
+          status.textContent = "Stopped.";
+          return;
+        }
+        const width = Math.floor(Number($("width").value));
+        const height = Math.floor(Number($("height").value));
+        const scale = Number($("scale").value);
+        if (!(width >= 1 && width <= 2048 && height >= 1 && height <= 2048)) {
+          return alert("Width and height must be 1..2048.");
+        }
+        if (!(scale > 0 && scale <= 1)) return alert("Scale must be in (0, 1].");
+        $("shot-result").classList.add("hidden");
+        status.classList.remove("hidden", "error");
+        $("shot-btn").textContent = "Stop";
+        try {
+          status.textContent = "Fetching required level…";
+          const { level } = await (await fetch("/shot/config")).json();
+          const doc = new TextEncoder().encode(
+            JSON.stringify({
+              url: $("url").value,
+              width,
+              height,
+              scale,
+              ts: Math.floor(Date.now() / 1000),
+            }),
+          );
+          const threads = Math.min(navigator.hardwareConcurrency || 4, 16);
+          running = ccmePow.solve(doc, level, threads, (attempts, dt) => {
+            status.textContent =
+              `Solving level ${level}: ${attempts.toLocaleString("en-US")} hashes, ` +
+              `${(attempts / dt / 1e6).toFixed(1)} MH/s`;
+          });
+          const { token, attempts, seconds } = await running.promise;
+          running = null;
+          status.textContent = "Rendering…";
+          const rendered = performance.now();
+          const response = await fetch(`/shot?token=${encodeURIComponent(token)}`);
+          if (!response.ok) {
+            const body = await response.text();
+            throw new Error(`${response.status}: ${body}`);
+          }
+          const cache = response.headers.get("x-cache") === "hit" ? "cache hit" : "freshly rendered";
+          const blob = await response.blob();
+          $("shot-img").src = URL.createObjectURL(blob);
+          status.classList.add("hidden");
+          $("shot-result").classList.remove("hidden");
+          $("shot-meta").textContent =
+            `solved level ${level} in ${seconds.toFixed(1)}s (${attempts.toLocaleString("en-US")} hashes), ` +
+            `${cache} in ${((performance.now() - rendered) / 1000).toFixed(1)}s, ` +
+            `${(blob.size / 1024).toFixed(0)} KiB`;
+        } catch (error) {
+          if (String(error.message) === "stopped") return;
+          status.classList.add("error");
+          status.textContent = `Failed — ${error.message}`;
+        } finally {
+          if (!running) $("shot-btn").textContent = "Screenshot";
+          running = null;
+        }
+      });
+    </script>
+  </body>
+</html>

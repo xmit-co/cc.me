@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>cc.me docs — Proof of work</title>
+    <meta
+      name="description"
+      content="A JWT-shaped proof-of-work token: base64url(doc).base64url(suffix), with trailing zero bits as the difficulty level."
+    />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="go-import" content="cc.me git https://github.com/xmit-co/cc.me" />
+    <meta
+      name="go-source"
+      content="cc.me https://github.com/xmit-co/cc.me https://github.com/xmit-co/cc.me/tree/main{/dir} https://github.com/xmit-co/cc.me/blob/main{/dir}/{file}#L{line}"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header>
+      <span class="brand"><a href="/">cc.me</a> / Proof of work</span>
+      <nav aria-label="Sections">
+        <a href="#format">Format</a>
+        <a href="#level">Level</a>
+        <a href="#docs">Documents</a>
+        <a href="#solve">Solve</a>
+        <a href="#verify">Verify</a>
+        <a href="#solvers">Solvers</a>
+      </nav>
+    </header>
+
+    <main>
+      <section class="intro">
+        <h1>Proof of work.</h1>
+        <p>
+          A JWT-shaped token that proves its issuer burned CPU (or GPU) time on a specific
+          document. Two base64url segments: the document and a suffix the solver searched for.
+          Anyone can verify it with two SHA-256 computations; finding it costs
+          2<sup><var>level</var></sup> of them on average.
+        </p>
+      </section>
+
+      <section id="format">
+        <h2>Format</h2>
+        <p>A token is two segments joined by a dot, like a JWT with one segment missing:</p>
+        <pre><code><span class="tok-call">b64u</span>(<span class="tok-id">doc</span>) <span class="tok-str">"."</span> <span class="tok-call">b64u</span>(<span class="tok-id">suffix</span>)</code></pre>
+        <ul>
+          <li>
+            <code>b64u</code> is unpadded base64url (RFC 4648 §5), exactly as in JWTs. Verifiers
+            reject segments that are not canonical unpadded base64url.
+          </li>
+          <li><code>doc</code> is an arbitrary byte string chosen by the application.</li>
+          <li>
+            <code>suffix</code> is 0 to 32 bytes chosen freely by the solver, typically an 8-byte
+            counter.
+          </li>
+        </ul>
+        <p>For example, with the document <code>hello world</code>:</p>
+        <pre><code>aGVsbG8gd29ybGQ.XBCKI7lQ3i4</code></pre>
+      </section>
+
+      <section id="level">
+        <h2>Level</h2>
+        <p>The level of a token is defined from a double SHA-256:</p>
+        <pre><code><span class="tok-id">check</span> = <span class="tok-call">SHA-256</span>(<span class="tok-call">SHA-256</span>(<span class="tok-id">doc</span>) || <span class="tok-id">suffix</span>)</code></pre>
+        <p>
+          Read <code>check</code> as a 256-bit big-endian integer — the first byte of the digest is
+          the most significant. The token's level is the number of trailing zero bits: the largest
+          <var>L</var> such that the integer is divisible by 2<sup><var>L</var></sup>. A token
+          proves level <var>L</var> when its level is at least <var>L</var>.
+        </p>
+        <p>The example token above hashes to</p>
+        <pre><code>0e5598dc7f613025fee4cf09cb8a15160894a7471d112a3b73a9b232f0<strong>300000</strong></code></pre>
+        <p>
+          which ends in five zero hex digits and <code>3</code> (binary <code>0011</code>): exactly
+          20 trailing zero bits, so it proves any level up to 20.
+        </p>
+        <p>
+          Each attempt is an independent coin flip: finding level <var>L</var> takes
+          2<sup><var>L</var></sup> hashes on average, with no shortcut and no memory to trade.
+          Hashing the document once and iterating only the suffix means solving cost does not
+          depend on document size: with an 8-byte suffix the search hashes a fixed 40-byte message,
+          a single SHA-256 block. Verification is two hashes regardless of level.
+        </p>
+        <p>Rough solving times, using the measured rates from the <a href="#solvers">benchmark below</a>:</p>
+        <dl>
+          <dt>16</dt>
+          <dd>65,536 hashes — instant anywhere.</dd>
+          <dt>20</dt>
+          <dd>1 million — 0.2&#8202;s in single-threaded JavaScript.</dd>
+          <dt>24</dt>
+          <dd>16.8 million — 3&#8202;s in single-threaded JavaScript, instant on a GPU.</dd>
+          <dt>28</dt>
+          <dd>268 million — under a minute of JavaScript, 0.13&#8202;s on an M5 Pro GPU.</dd>
+          <dt>32</dt>
+          <dd>4.3 billion — a coffee break in JavaScript, 2&#8202;s on that GPU.</dd>
+          <dt>36</dt>
+          <dd>68.7 billion — half a minute on that GPU.</dd>
+          <dt>40</dt>
+          <dd>1.1 trillion — 9 minutes on that GPU; pick this only to price out GPUs too.</dd>
+        </dl>
+      </section>
+
+      <section id="docs">
+        <h2>Documents</h2>
+        <p>
+          The scheme does not interpret the document; the application must make it worthless to
+          replay. Include whatever binds the proof to its use — an audience, an action, a timestamp,
+          a server-issued nonce — and reject tokens whose document you did not expect or have seen
+          before. A proof of work rate-limits; it does not authenticate.
+        </p>
+        <p>
+          Choose levels from the attacker's hardware, not the visitor's: SHA-256 runs about 400×
+          faster on one GPU than on one browser thread (see <a href="#solvers">below</a>), and
+          Bitcoin ASICs are another five orders of magnitude beyond that.
+        </p>
+      </section>
+
+      <section id="solve">
+        <h2>Solve</h2>
+        <p>
+          Runs entirely in this page, on Web Workers hashing in pure JavaScript. Nothing is sent
+          anywhere.
+        </p>
+        <noscript><p class="status error">JavaScript is required to solve in the browser.</p></noscript>
+        <div class="pow-form">
+          <label>Document <textarea id="doc" rows="3">hello world</textarea></label>
+          <div class="pow-row">
+            <label>Level <input id="solve-level" type="number" min="1" max="64" value="20" /></label>
+            <label>Workers <input id="workers" type="number" min="1" max="64" value="4" /></label>
+            <button id="solve-btn" type="button">Solve</button>
+          </div>
+          <p id="solve-status" class="note hidden"></p>
+          <div id="solve-result" class="pow-result hidden">
+            <label>Token <input id="token-out" readonly /></label>
+            <div class="actions">
+              <button id="copy-btn" type="button">Copy</button>
+              <span id="solve-meta" class="note"></span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="verify">
+        <h2>Verify</h2>
+        <div class="pow-form">
+          <label>Token <textarea id="token-in" rows="3" placeholder="aGVsbG8gd29ybGQ.XBCKI7lQ3i4"></textarea></label>
+          <div class="pow-row">
+            <button id="verify-btn" type="button">Verify</button>
+          </div>
+          <p id="verify-out" class="note hidden"></p>
+        </div>
+      </section>
+
+      <section id="solvers">
+        <h2>Solvers</h2>
+        <p>
+          Reference solvers live in <a href="https://github.com/xmit-co/cc.me/tree/main/pow"><code>pow/</code></a>:
+          <code>pow.mjs</code>, a Node CLI whose miner is the same pure-JavaScript SHA-256 this page
+          uses; <code>pow.swift</code>, a Metal compute kernel for Apple GPUs; and
+          <code>pow.c</code>, the same kernel in OpenCL for NVIDIA and AMD GPUs (and anything else
+          with an OpenCL driver). All solve, verify, and benchmark:
+        </p>
+        <pre><code>node pow.mjs solve 32 <span class="tok-str">'hello world'</span>
+swiftc -O pow.swift -o pow &amp;&amp; ./pow solve 40 <span class="tok-str">'hello world'</span>
+cc -O2 pow.c -lOpenCL -o pow-cl &amp;&amp; ./pow-cl solve 40 <span class="tok-str">'hello world'</span></code></pre>
+        <p>Measured on an Apple M5 Pro (18 CPU cores, 20-core GPU), 10-second runs:</p>
+        <dl>
+          <dt>5.4 MH/s</dt>
+          <dd>V8 (Node 24), one thread.</dd>
+          <dt>72 MH/s</dt>
+          <dd>V8, 18 worker threads.</dd>
+          <dt>2,033 MH/s</dt>
+          <dd>Metal, one kernel hashing one block per GPU thread — 377× one V8 thread, 28× all of them.</dd>
+          <dt>2,031 MH/s</dt>
+          <dd>OpenCL, the same kernel on the same GPU through Apple's legacy OpenCL.</dd>
+        </dl>
+      </section>
+
+      <footer>
+        By <a href="https://xmit.dev/">xmit dev team</a>. The format is public domain; solving
+        happens on your hardware.
+      </footer>
+    </main>
+
+    <script src="./pow.js"></script>
+    <script>
+      "use strict";
+
+      const { b64u, unb64u, trailingZeroBits, checkDigest, solve } = ccmePow;
+      const $ = (id) => document.getElementById(id);
+      const encoder = new TextEncoder();
+
+      // ---- solve -------------------------------------------------------------
+
+      const workersInput = $("workers");
+      workersInput.value = Math.min(navigator.hardwareConcurrency || 4, 16);
+      let running = null;
+
+      $("solve-btn").addEventListener("click", async () => {
+        if (running) {
+          running.stop();
+          running = null;
+          $("solve-btn").textContent = "Solve";
+          $("solve-status").textContent = "Stopped.";
+          return;
+        }
+        const level = Math.floor(Number($("solve-level").value));
+        const threads = Math.floor(Number(workersInput.value));
+        if (!(level >= 1 && level <= 64)) return alert("Level must be 1..64.");
+        if (!(threads >= 1 && threads <= 64)) return alert("Workers must be 1..64.");
+        const doc = encoder.encode($("doc").value);
+
+        $("solve-result").classList.add("hidden");
+        $("solve-status").classList.remove("hidden");
+        $("solve-status").textContent = "Starting\u2026";
+        $("solve-btn").textContent = "Stop";
+        const expected = 2 ** level;
+        running = solve(doc, level, threads, (attempts, dt) => {
+          const rate = attempts / dt;
+          const eta = rate > 0 ? (expected - attempts) / rate : Infinity;
+          $("solve-status").textContent =
+            `${attempts.toLocaleString("en-US")} hashes, ${(rate / 1e6).toFixed(1)} MH/s \u2014 ` +
+            `expected 2^${level} = ${expected.toLocaleString("en-US")}` +
+            (eta > 0 && eta < 1e9 ? `, ~${Math.ceil(eta)}s to go on average` : "");
+        });
+        try {
+          const { suffix, token, attempts, seconds } = await running.promise;
+          running = null;
+          $("solve-btn").textContent = "Solve";
+          const achieved = trailingZeroBits(await checkDigest(doc, suffix));
+          $("solve-status").classList.add("hidden");
+          $("solve-result").classList.remove("hidden");
+          $("token-out").value = token;
+          $("solve-meta").textContent =
+            `level ${achieved}, ${attempts.toLocaleString("en-US")} hashes in ${seconds.toFixed(1)}s ` +
+            `(${(attempts / seconds / 1e6).toFixed(1)} MH/s)`;
+        } catch {
+          // stopped
+        }
+      });
+
+      $("copy-btn").addEventListener("click", async () => {
+        await navigator.clipboard.writeText($("token-out").value);
+        $("copy-btn").textContent = "Copied";
+        setTimeout(() => ($("copy-btn").textContent = "Copy"), 1200);
+      });
+
+      // ---- verify ------------------------------------------------------------
+
+      $("verify-btn").addEventListener("click", async () => {
+        const out = $("verify-out");
+        out.classList.remove("hidden", "error");
+        const token = $("token-in").value.trim();
+        try {
+          const dot = token.indexOf(".");
+          if (dot < 0) throw new Error("no dot separator");
+          const doc = unb64u(token.slice(0, dot));
+          const suffix = unb64u(token.slice(dot + 1));
+          if (suffix.length > 32) throw new Error("suffix longer than 32 bytes");
+          const digest = await checkDigest(doc, suffix);
+          const level = trailingZeroBits(digest);
+          const hex = Array.from(digest, (b) => b.toString(16).padStart(2, "0")).join("");
+          let docText;
+          try {
+            docText = new TextDecoder("utf-8", { fatal: true }).decode(doc);
+          } catch {
+            docText = null;
+          }
+          out.textContent =
+            `Level ${level}. check = ${hex}. ` +
+            `Document (${doc.length} bytes): ` +
+            (docText === null ? "not valid UTF-8" : JSON.stringify(docText));
+        } catch (error) {
+          out.classList.add("error");
+          out.textContent = `Invalid token: ${error.message}.`;
+        }
+      });
+    </script>
+  </body>
+</html>

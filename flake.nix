@@ -35,11 +35,25 @@
         cc-me = craneLib.buildPackage (commonArgs // {
           inherit cargoArtifacts;
         });
+        # OpenCL proof-of-work solver (NVIDIA/AMD); Linux-only — macOS builds
+        # pow/ with the system toolchain instead (see pow/README.md).
+        pow-cl = pkgs.stdenv.mkDerivation {
+          pname = "pow-cl";
+          version = "0.1.0";
+          src = ./pow;
+          nativeBuildInputs = [ pkgs.ninja ];
+          buildInputs = [ pkgs.opencl-headers pkgs.ocl-icd ];
+          postPatch = "patchShebangs configure";
+          configurePhase = "./configure";
+          installPhase = "install -Dm755 pow-cl $out/bin/pow-cl";
+        };
       in
       {
         packages = {
           default = cc-me;
           cc-me = cc-me;
+        } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+          pow-cl = pow-cl;
         };
 
         apps = {
@@ -62,6 +76,12 @@
             (pkgs.python3.withPackages (ps: [ ps.pynacl ]))
             pkgs.ruby
             pkgs.libsodium
+            pkgs.ninja
+          ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+            # For pow/pow.c, the OpenCL GPU solver (NVIDIA/AMD; macOS uses the
+            # system OpenCL framework instead).
+            pkgs.opencl-headers
+            pkgs.ocl-icd
           ];
         };
       });

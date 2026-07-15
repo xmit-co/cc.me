@@ -1,0 +1,25 @@
+#!/usr/bin/env sh
+# Writes config.ninja (compilers, OpenCL link flags) and defaults.ninja (which
+# solvers this platform builds) for build.ninja.
+set -eu
+cd "$(dirname "$0")"
+case "$(uname -s)" in
+Darwin)
+  # The repo's Nix devshell pins SDKROOT/DEVELOPER_DIR to an SDK the system
+  # toolchain refuses; drop them and use the /usr/bin tools.
+  cat >config.ninja <<'EOF'
+cc = env -u SDKROOT -u DEVELOPER_DIR /usr/bin/cc
+swiftc = env -u SDKROOT -u DEVELOPER_DIR /usr/bin/swiftc
+clldflags = -framework OpenCL
+EOF
+  echo "default pow-cl pow" >defaults.ninja
+  ;;
+*)
+  cat >config.ninja <<EOF
+cc = ${CC:-cc}
+clldflags = -lOpenCL
+EOF
+  echo "default pow-cl" >defaults.ninja
+  ;;
+esac
+echo "wrote config.ninja and defaults.ninja; run: ninja"
