@@ -5108,6 +5108,31 @@ fn shot_backend_error(err: String) -> AppError {
     AppError::new(StatusCode::SERVICE_UNAVAILABLE, "screenshot backend unavailable")
 }
 
+// Disposes the render's browser context — closing its tab and dropping all its
+// state — on every exit path: normal completion, errors, and cancellation
+// (timeouts and disconnecting clients drop the render future mid-flight, so an
+// inline call after the render would not run).
+struct ShotContextGuard {
+    client: CdpClient,
+    context_id: String,
+}
+
+impl Drop for ShotContextGuard {
+    fn drop(&mut self) {
+        let client = self.client.clone();
+        let context_id = std::mem::take(&mut self.context_id);
+        tokio::spawn(async move {
+            let _ = client
+                .call(
+                    None,
+                    "Target.disposeBrowserContext",
+                    json!({ "browserContextId": context_id }),
+                )
+                .await;
+        });
+    }
+}
+
 async fn shot_render(client: &CdpClient, spec: &ShotSpec, nav_timeout: Duration) -> AppResult<Vec<u8>> {
     let context = client
         .call(None, "Target.createBrowserContext", json!({}))
@@ -5116,17 +5141,11 @@ async fn shot_render(client: &CdpClient, spec: &ShotSpec, nav_timeout: Duration)
     let Some(context_id) = context.get("browserContextId").and_then(Value::as_str) else {
         return Err(shot_backend_error("no browserContextId".to_owned()));
     };
-    let context_id = context_id.to_owned();
-    let result = shot_render_in_context(client, &context_id, spec, nav_timeout).await;
-    // Disposing the context closes its targets and drops all its state.
-    let _ = client
-        .call(
-            None,
-            "Target.disposeBrowserContext",
-            json!({ "browserContextId": context_id }),
-        )
-        .await;
-    result
+    let _guard = ShotContextGuard {
+        client: client.clone(),
+        context_id: context_id.to_owned(),
+    };
+    shot_render_in_context(client, context_id, spec, nav_timeout).await
 }
 
 async fn shot_render_in_context(

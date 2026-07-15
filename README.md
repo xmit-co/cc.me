@@ -51,9 +51,19 @@ nix run github:xmit-co/cc.me
 | `INBOX_DEFAULT_GET_LIMIT` |                                  `1` | Default GET/claim batch size when a limit is omitted    |
 | `INBOX_MAX_GET_LIMIT`     |                               `1000` | Cap for requested batch sizes                           |
 | `INBOX_LONG_POLL_SECONDS` |                                 `25` | Long-poll wait used by `?p` and `claim({ poll: true })` |
+| `SHOT_CHROME_BIN`         |                           `chromium` | Chromium binary managed for `/shot` screenshots         |
+| `SHOT_CHROME_ARGS`        |                              _empty_ | Extra whitespace-separated Chromium flags               |
+| `SHOT_POW_LEVEL`          |                                 `24` | Proof-of-work level required by `/shot`                 |
+| `SHOT_TS_WINDOW_SECONDS`  |                                `300` | Accepted `ts` skew in `/shot` documents                 |
+| `SHOT_NAV_TIMEOUT_SECONDS`|                                 `10` | Page-load timeout per screenshot                        |
+| `SHOT_CACHE_SECONDS`      |                               `3600` | Screenshot cache lifetime                               |
 
 `GET /pow` documents a JWT-shaped proof-of-work token format with an in-browser
-solver and verifier; reference CPU (Node) and GPU (Metal) solvers live in `pow/`.
+solver and verifier; reference CPU (Node) and GPU (Metal, OpenCL) solvers live
+in `pow/`. `GET /shot` renders screenshots in a managed headless Chrome —
+disposable incognito-style contexts, up to 2048×2048 with Chrome-side
+downscaling, cached for an hour — paid for with proof-of-work tokens; the
+required level and other expectations are served at `GET /shot/config`.
 
 Static docs live in `docs/`. The Go client is the module at the repository root
 (`go install cc.me@latest` for the CLI, `import "cc.me/ccme"` for the library;
