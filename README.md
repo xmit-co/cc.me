@@ -53,7 +53,7 @@ nix run github:xmit-co/cc.me
 | `INBOX_LONG_POLL_SECONDS` |                                 `25` | Long-poll wait used by `?p` and `claim({ poll: true })` |
 | `SHOT_CHROME_BIN`         |                           `chromium` | Chromium binary managed for `/shot` screenshots         |
 | `SHOT_CHROME_ARGS`        |                              _empty_ | Extra whitespace-separated Chromium flags               |
-| `SHOT_POW_LEVEL`          |                                 `24` | Proof-of-work level required by `/shot`                 |
+| `SHOT_POW_LEVEL`          |                                 `22` | Proof-of-work level required by `/shot`                 |
 | `SHOT_TS_WINDOW_SECONDS`  |                                `300` | Accepted `ts` skew in `/shot` documents                 |
 | `SHOT_NAV_TIMEOUT_SECONDS`|                                 `10` | Page-load timeout per screenshot                        |
 | `SHOT_CACHE_SECONDS`      |                               `3600` | Screenshot cache lifetime                               |

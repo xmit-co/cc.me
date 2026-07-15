@@ -201,7 +201,7 @@ cc -O2 pow.c -lOpenCL -o pow-cl &amp;&amp; ./pow-cl solve 40 <span class="tok-st
     <script>
       "use strict";
 
-      const { b64u, unb64u, trailingZeroBits, checkDigest, solve } = ccmePow;
+      const { b64u, unb64u, trailingZeroBits, checkDigest, solve, formatRate } = ccmePow;
       const $ = (id) => document.getElementById(id);
       const encoder = new TextEncoder();
 
@@ -226,7 +226,7 @@ cc -O2 pow.c -lOpenCL -o pow-cl &amp;&amp; ./pow-cl solve 40 <span class="tok-st
         const doc = encoder.encode($("doc").value);
 
         $("solve-result").classList.add("hidden");
-        $("solve-status").classList.remove("hidden");
+        $("solve-status").classList.remove("hidden", "error");
         $("solve-status").textContent = "Starting\u2026";
         $("solve-btn").textContent = "Stop";
         const expected = 2 ** level;
@@ -234,7 +234,7 @@ cc -O2 pow.c -lOpenCL -o pow-cl &amp;&amp; ./pow-cl solve 40 <span class="tok-st
           const rate = attempts / dt;
           const eta = rate > 0 ? (expected - attempts) / rate : Infinity;
           $("solve-status").textContent =
-            `${attempts.toLocaleString("en-US")} hashes, ${(rate / 1e6).toFixed(1)} MH/s \u2014 ` +
+            `${attempts.toLocaleString("en-US")} hashes, ${formatRate(rate)} \u2014 ` +
             `expected 2^${level} = ${expected.toLocaleString("en-US")}` +
             (eta > 0 && eta < 1e9 ? `, ~${Math.ceil(eta)}s to go on average` : "");
         });
@@ -248,9 +248,14 @@ cc -O2 pow.c -lOpenCL -o pow-cl &amp;&amp; ./pow-cl solve 40 <span class="tok-st
           $("token-out").value = token;
           $("solve-meta").textContent =
             `level ${achieved}, ${attempts.toLocaleString("en-US")} hashes in ${seconds.toFixed(1)}s ` +
-            `(${(attempts / seconds / 1e6).toFixed(1)} MH/s)`;
-        } catch {
-          // stopped
+            `(${formatRate(attempts / seconds)})`;
+        } catch (error) {
+          $("solve-btn").textContent = "Solve";
+          running = null;
+          if (String(error.message) !== "stopped") {
+            $("solve-status").classList.add("error");
+            $("solve-status").textContent = `Failed \u2014 ${error.message}`;
+          }
         }
       });
 

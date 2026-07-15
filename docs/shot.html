@@ -75,13 +75,13 @@
           </dd>
         </dl>
         <p>
-          Solve to the level from <code>/shot/config</code> — default 24, sized so a GPU pays a few
+          Solve to the level from <code>/shot/config</code> — default 22, sized so a GPU pays a couple of
           milliseconds and browser workers a few seconds — with any solver from the
           <a href="/pow#solvers">proof-of-work page</a>:
         </p>
         <pre><code>doc=$(jq -nc --arg url https://example.com/ \
   '{url: $url, width: 800, height: 600, scale: 0.5, ts: now | floor}')
-curl -sG https://cc.me/shot --data-urlencode "token=$(node pow.mjs solve 24 "$doc")" -o shot.png</code></pre>
+curl -sG https://cc.me/shot --data-urlencode "token=$(node pow.mjs solve 22 "$doc")" -o shot.png</code></pre>
         <p>
           Identical documents (ignoring <code>ts</code>) hit the same cache entry, so retrying
           within the hour is free for the server and instant for you.
@@ -172,9 +172,12 @@ curl -sG https://cc.me/shot --data-urlencode "token=$(node pow.mjs solve 24 "$do
           );
           const threads = Math.min(navigator.hardwareConcurrency || 4, 16);
           running = ccmePow.solve(doc, level, threads, (attempts, dt) => {
+            const rate = attempts / dt;
+            const eta = rate > 0 ? (2 ** level - attempts) / rate : Infinity;
             status.textContent =
               `Solving level ${level}: ${attempts.toLocaleString("en-US")} hashes, ` +
-              `${(attempts / dt / 1e6).toFixed(1)} MH/s`;
+              ccmePow.formatRate(rate) +
+              (eta > 0 && eta < 1e9 ? ` \u2014 ~${Math.ceil(eta)}s to go on average` : "");
           });
           const { token, attempts, seconds } = await running.promise;
           running = null;

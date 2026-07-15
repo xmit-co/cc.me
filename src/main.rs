@@ -4681,9 +4681,9 @@ impl Config {
             shot_chrome_args: env::var("SHOT_CHROME_ARGS")
                 .map(|args| args.split_whitespace().map(str::to_owned).collect())
                 .unwrap_or_default(),
-            // Default sized for GPUs: ~17M hashes is a few milliseconds on one
+            // Default sized for GPUs: ~4M hashes is a couple of milliseconds on one
             // (see pow/README.md), seconds for browser workers.
-            shot_pow_level: env_u64("SHOT_POW_LEVEL", 24).clamp(1, 64) as u32,
+            shot_pow_level: env_u64("SHOT_POW_LEVEL", 22).clamp(1, 64) as u32,
             shot_ts_window_seconds: env_u64("SHOT_TS_WINDOW_SECONDS", 300).max(1) as i64,
             shot_nav_timeout_seconds: env_f64("SHOT_NAV_TIMEOUT_SECONDS", 10.0).max(1.0),
             shot_cache_seconds: env_f64("SHOT_CACHE_SECONDS", 3600.0).max(1.0),
@@ -5991,7 +5991,7 @@ mod tests {
             fonts_refresh_interval_seconds: 0,
             shot_chrome_bin: "chromium".to_owned(),
             shot_chrome_args: Vec::new(),
-            shot_pow_level: 24,
+            shot_pow_level: 22,
             shot_ts_window_seconds: 300,
             shot_nav_timeout_seconds: 10.0,
             shot_cache_seconds: 3600.0,
@@ -6036,7 +6036,7 @@ mod tests {
             fonts_refresh_interval_seconds: 0,
             shot_chrome_bin: "chromium".to_owned(),
             shot_chrome_args: Vec::new(),
-            shot_pow_level: 24,
+            shot_pow_level: 22,
             shot_ts_window_seconds: 300,
             shot_nav_timeout_seconds: 10.0,
             shot_cache_seconds: 3600.0,
@@ -7161,7 +7161,7 @@ axes {
             fonts_refresh_interval_seconds: 0,
             shot_chrome_bin: "chromium".to_owned(),
             shot_chrome_args: Vec::new(),
-            shot_pow_level: 24,
+            shot_pow_level: 22,
             shot_ts_window_seconds: 300,
             shot_nav_timeout_seconds: 10.0,
             shot_cache_seconds: 3600.0,

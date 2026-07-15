@@ -27,11 +27,14 @@ const ccmePow = (() => {
       W[15] = 320; // bit length of the 40-byte message
       const maskLo = level >= 32 ? -1 : (1 << level) - 1;
       const maskHi = level <= 32 ? 0 : level >= 64 ? -1 : (1 << (level - 32)) - 1;
-      const CHUNK = 1 << 20;
+      // Chunk adaptively so progress reports arrive a few times per second
+      // even on slow devices (phones, or browsers with the JIT disabled).
+      let chunk = 1 << 14;
       let hi = startHi | 0;
       let lo = startLo | 0;
       for (;;) {
-        for (let i = 0; i < CHUNK; i++) {
+        const started = performance.now();
+        for (let i = 0; i < chunk; i++) {
           W[8] = hi;
           W[9] = lo;
           for (let t = 16; t < 64; t++) {
@@ -62,7 +65,10 @@ const ccmePow = (() => {
           lo = (lo + 1) | 0;
           if (lo === 0) hi = (hi + 1) | 0;
         }
-        postMessage({ n: CHUNK });
+        postMessage({ n: chunk });
+        const elapsed = performance.now() - started;
+        if (elapsed < 125 && chunk < 1 << 20) chunk <<= 1;
+        else if (elapsed > 500 && chunk > 1 << 14) chunk >>= 1;
       }
     };
   `;
@@ -146,6 +152,10 @@ const ccmePow = (() => {
           const start = new Int32Array(2);
           crypto.getRandomValues(start);
           const worker = new Worker(minerUrl);
+          worker.onerror = (event) => {
+            stopAll();
+            reject(new Error(event.message || "worker failed to start"));
+          };
           worker.onmessage = (event) => {
             const m = event.data;
             attempts += m.n;
@@ -167,5 +177,12 @@ const ccmePow = (() => {
     return { promise, stop: () => stop() };
   }
 
-  return { b64u, unb64u, trailingZeroBits, sha256, checkDigest, solve };
+  // Readable at any speed: phones and JIT-less browsers sit well under 1 MH/s.
+  function formatRate(perSecond) {
+    if (perSecond >= 1e6) return `${(perSecond / 1e6).toFixed(1)} MH/s`;
+    if (perSecond >= 1e3) return `${Math.round(perSecond / 1e3)} kH/s`;
+    return `${Math.round(perSecond)} H/s`;
+  }
+
+  return { b64u, unb64u, trailingZeroBits, sha256, checkDigest, solve, formatRate };
 })();
