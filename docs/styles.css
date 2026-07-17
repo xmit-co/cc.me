@@ -516,7 +516,8 @@ input:disabled {
   font-weight: 500;
 }
 .pow-form textarea,
-.pow-form input {
+.pow-form input,
+.pow-form select {
   font: inherit;
   padding: 0.625em 0.75em;
   border: thin solid var(--l);
@@ -530,7 +531,8 @@ input:disabled {
   font-size: 0.875em;
 }
 .pow-form textarea:focus,
-.pow-form input:focus {
+.pow-form input:focus,
+.pow-form select:focus {
   outline: none;
   border-color: var(--a);
 }
@@ -552,6 +554,10 @@ input:disabled {
   border: thin solid var(--l);
   border-radius: 0.375em;
   background: var(--c);
+}
+/* Declared after .hidden, so it must not win the display fight on load. */
+.pow-result.hidden {
+  display: none;
 }
 .pow-result input {
   font-family: ui-monospace, monospace;
