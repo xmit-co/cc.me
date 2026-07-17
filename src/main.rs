@@ -4848,6 +4848,25 @@ fn shot_default_scale() -> f64 {
     1.0
 }
 
+// Which `prefers-color-scheme` the page renders under. Defaults to light, the
+// browser's own default, so existing tokens keep rendering identically.
+#[derive(Deserialize, Clone, Copy, Default, PartialEq, Eq, Debug)]
+#[serde(rename_all = "lowercase")]
+enum ColorScheme {
+    #[default]
+    Light,
+    Dark,
+}
+
+impl ColorScheme {
+    fn as_str(self) -> &'static str {
+        match self {
+            ColorScheme::Light => "light",
+            ColorScheme::Dark => "dark",
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ShotSpec {
@@ -4856,6 +4875,8 @@ struct ShotSpec {
     height: u32,
     #[serde(default = "shot_default_scale")]
     scale: f64,
+    #[serde(default)]
+    scheme: ColorScheme,
     ts: i64,
 }
 
@@ -4896,8 +4917,8 @@ impl ShotSpec {
     // cache entry for an otherwise identical request.
     fn cache_key(&self) -> String {
         let digest = Sha256::digest(format!(
-            "{}\n{}\n{}\n{}",
-            self.url, self.width, self.height, self.scale
+            "{}\n{}\n{}\n{}\n{}",
+            self.url, self.width, self.height, self.scale, self.scheme.as_str()
         ));
         URL_SAFE_NO_PAD.encode(digest)
     }
@@ -5303,6 +5324,21 @@ async fn shot_render_in_context(
                 "height": spec.height,
                 "deviceScaleFactor": spec.scale,
                 "mobile": false,
+            }),
+        )
+        .await
+        .map_err(shot_backend_error)?;
+    // Emulate prefers-color-scheme before navigating so the page's first paint
+    // already matches; set it explicitly for both schemes rather than relying
+    // on the browser default.
+    client
+        .call(
+            Some(session),
+            "Emulation.setEmulatedMedia",
+            json!({
+                "features": [
+                    { "name": "prefers-color-scheme", "value": spec.scheme.as_str() },
+                ],
             }),
         )
         .await
@@ -7014,6 +7050,7 @@ mod tests {
             width,
             height,
             scale,
+            scheme: ColorScheme::Light,
             ts,
         };
 
@@ -7030,6 +7067,9 @@ mod tests {
         // The cache key covers everything but ts.
         assert_eq!(spec(800, 600, 0.5, now).cache_key(), spec(800, 600, 0.5, 0).cache_key());
         assert_ne!(spec(800, 600, 0.5, now).cache_key(), spec(800, 601, 0.5, now).cache_key());
+        // Light and dark render differently, so they cache separately.
+        let dark = ShotSpec { scheme: ColorScheme::Dark, ..spec(800, 600, 0.5, now) };
+        assert_ne!(spec(800, 600, 0.5, now).cache_key(), dark.cache_key());
 
         // Unknown fields are rejected: the doc must be exactly the spec.
         assert!(
@@ -7038,12 +7078,25 @@ mod tests {
             )
             .is_err()
         );
-        // scale is optional and defaults to 1.
+        // scale is optional and defaults to 1; scheme defaults to light.
         let parsed: ShotSpec = serde_json::from_str(
             r#"{"url":"https://example.com/","width":1,"height":1,"ts":0}"#,
         )
         .unwrap();
         assert_eq!(parsed.scale, 1.0);
+        assert_eq!(parsed.scheme, ColorScheme::Light);
+        // scheme accepts "dark" and rejects anything else.
+        let dark: ShotSpec = serde_json::from_str(
+            r#"{"url":"https://example.com/","width":1,"height":1,"ts":0,"scheme":"dark"}"#,
+        )
+        .unwrap();
+        assert_eq!(dark.scheme, ColorScheme::Dark);
+        assert!(
+            serde_json::from_str::<ShotSpec>(
+                r#"{"url":"https://example.com/","width":1,"height":1,"ts":0,"scheme":"sepia"}"#
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -68,6 +68,12 @@
             Optional downscale factor in (0, 1], default 1. The PNG comes back at
             <code>width×scale</code> by <code>height×scale</code> pixels; Chrome does the scaling.
           </dd>
+          <dt><code>scheme</code></dt>
+          <dd>
+            Optional <code>"light"</code> or <code>"dark"</code>, default <code>"light"</code>.
+            Sets the <code>prefers-color-scheme</code> the page renders under, so a site with a dark
+            theme paints dark.
+          </dd>
           <dt><code>ts</code></dt>
           <dd>
             Current Unix time in seconds. Accepted within 5 minutes either way, so tokens cannot be
@@ -80,7 +86,7 @@
           <a href="/pow#solvers">proof-of-work page</a>:
         </p>
         <pre><code>doc=$(jq -nc --arg url https://example.com/ \
-  '{url: $url, width: 800, height: 600, scale: 0.5, ts: now | floor}')
+  '{url: $url, width: 800, height: 600, scale: 0.5, scheme: "dark", ts: now | floor}')
 curl -sG https://cc.me/shot --data-urlencode "token=$(node pow.mjs solve 22 "$doc")" -o shot.png</code></pre>
         <p>
           Identical documents (ignoring <code>ts</code>) hit the same cache entry, so retrying
@@ -100,6 +106,12 @@ curl -sG https://cc.me/shot --data-urlencode "token=$(node pow.mjs solve 22 "$do
             <label>Width <input id="width" type="number" min="1" max="2048" value="1024" /></label>
             <label>Height <input id="height" type="number" min="1" max="2048" value="768" /></label>
             <label>Scale <input id="scale" type="number" min="0.05" max="1" step="0.05" value="0.5" /></label>
+            <label>Scheme
+              <select id="scheme">
+                <option value="light">light</option>
+                <option value="dark">dark</option>
+              </select>
+            </label>
             <button id="shot-btn" type="button">Screenshot</button>
           </div>
           <p id="shot-status" class="note hidden"></p>
@@ -114,7 +126,7 @@ curl -sG https://cc.me/shot --data-urlencode "token=$(node pow.mjs solve 22 "$do
         <h2>Errors</h2>
         <dl>
           <dt><code>400</code></dt>
-          <dd>Malformed token or document, out-of-range size or scale, stale <code>ts</code>, or a URL pointing at a non-public address.</dd>
+          <dd>Malformed token or document, out-of-range size or scale, unknown <code>scheme</code>, stale <code>ts</code>, or a URL pointing at a non-public address.</dd>
           <dt><code>403</code></dt>
           <dd>Proof of work below the required level.</dd>
           <dt><code>502</code></dt>
@@ -167,6 +179,7 @@ curl -sG https://cc.me/shot --data-urlencode "token=$(node pow.mjs solve 22 "$do
               width,
               height,
               scale,
+              scheme: $("scheme").value,
               ts: Math.floor(Date.now() / 1000),
             }),
           );
