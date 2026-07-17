@@ -4953,6 +4953,9 @@ async fn shot_check_url(url_text: &str) -> AppResult<()> {
 struct CdpClient {
     tx: mpsc::Sender<CdpRequest>,
     renders: Arc<AtomicU64>,
+    // The browser's own user agent with the HeadlessChrome marker scrubbed;
+    // applied to every page so rendered sites see a regular Chrome.
+    user_agent: Arc<str>,
 }
 
 enum CdpRequest {
@@ -5143,11 +5146,23 @@ async fn spawn_chrome(config: &Config) -> Result<CdpClient, String> {
         .map_err(|err| format!("connect to chrome: {err}"))?;
     let (tx, rx) = mpsc::channel(64);
     tokio::spawn(cdp_actor(ws, rx, child, user_data_dir));
-    info!("chrome ready for screenshots");
-    Ok(CdpClient {
+    let mut client = CdpClient {
         tx,
         renders: Arc::new(AtomicU64::new(0)),
-    })
+        user_agent: Arc::from(""),
+    };
+    // Headless Chrome announces itself as "HeadlessChrome/<version>" in the
+    // user agent; keep the browser's own string (so the version stays honest)
+    // minus the headless marker.
+    let version = client.call(None, "Browser.getVersion", json!({})).await?;
+    let user_agent = version
+        .get("userAgent")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Browser.getVersion returned no userAgent".to_owned())?
+        .replace("HeadlessChrome", "Chrome");
+    client.user_agent = Arc::from(user_agent);
+    info!("chrome ready for screenshots");
+    Ok(client)
 }
 
 async fn chrome_client(state: &AppState) -> AppResult<CdpClient> {
@@ -5245,6 +5260,36 @@ async fn shot_render_in_context(
     };
     client
         .call(Some(session), "Page.enable", json!({}))
+        .await
+        .map_err(shot_backend_error)?;
+    // Overriding the UA suppresses UA client hints unless metadata comes with
+    // it, and the default brand list also says "HeadlessChrome" — send a plain
+    // Chromium brand set at the browser's real major version.
+    let major = client
+        .user_agent
+        .split("Chrome/")
+        .nth(1)
+        .and_then(|version| version.split('.').next())
+        .unwrap_or("0");
+    client
+        .call(
+            Some(session),
+            "Emulation.setUserAgentOverride",
+            json!({
+                "userAgent": &*client.user_agent,
+                "userAgentMetadata": {
+                    "brands": [
+                        { "brand": "Chromium", "version": major },
+                        { "brand": "Not=A?Brand", "version": "24" },
+                    ],
+                    "platform": "Linux",
+                    "platformVersion": "",
+                    "architecture": "x86",
+                    "model": "",
+                    "mobile": false,
+                },
+            }),
+        )
         .await
         .map_err(shot_backend_error)?;
     // deviceScaleFactor is where the downscaling happens: the PNG comes out at
