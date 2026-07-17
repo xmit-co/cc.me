@@ -62,7 +62,7 @@ nix run github:xmit-co/cc.me
 solver and verifier; reference CPU (Node) and GPU (Metal, OpenCL) solvers live
 in `pow/`. `GET /shot` renders screenshots in a managed headless Chrome —
 disposable incognito-style contexts, up to 2048×2048 with Chrome-side
-downscaling, cached for an hour — paid for with proof-of-work tokens; the
+downscaling, cached for an hour — gated by proof-of-work tokens; the
 required level and other expectations are served at `GET /shot/config`.
 
 Static docs live in `docs/`. The Go client is the module at the repository root
