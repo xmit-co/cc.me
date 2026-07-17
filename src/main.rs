@@ -422,6 +422,7 @@ struct StatsBucket {
     secrets: usize,
     favicons: usize,
     fonts: usize,
+    shots: usize,
 }
 
 #[derive(Serialize)]
@@ -434,6 +435,7 @@ struct StatCounts {
     secrets: usize,
     favicons: usize,
     fonts: usize,
+    shots: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -3316,6 +3318,7 @@ async fn load_stats(state: &AppState) -> AppResult<StatsResponse> {
         favicons: count_total(&state.db, StatKind::Favicon, StatPeriod::Hour, &hour_buckets)
             .await?,
         fonts: count_total(&state.db, StatKind::Font, StatPeriod::Hour, &hour_buckets).await?,
+        shots: count_total(&state.db, StatKind::Shot, StatPeriod::Hour, &hour_buckets).await?,
     };
     let last_30_days = StatCounts {
         redirects: count_total(&state.db, StatKind::Redirect, StatPeriod::Day, &day_buckets)
@@ -3328,6 +3331,7 @@ async fn load_stats(state: &AppState) -> AppResult<StatsResponse> {
         secrets: count_total(&state.db, StatKind::Secret, StatPeriod::Day, &day_buckets).await?,
         favicons: count_total(&state.db, StatKind::Favicon, StatPeriod::Day, &day_buckets).await?,
         fonts: count_total(&state.db, StatKind::Font, StatPeriod::Day, &day_buckets).await?,
+        shots: count_total(&state.db, StatKind::Shot, StatPeriod::Day, &day_buckets).await?,
     };
 
     let hourly = stat_buckets(&state.db, hour_buckets, 3600, StatPeriod::Hour).await?;
@@ -3356,6 +3360,7 @@ async fn stat_buckets(
     let secrets = count_series(db, StatKind::Secret, period, &buckets).await?;
     let favicons = count_series(db, StatKind::Favicon, period, &buckets).await?;
     let fonts = count_series(db, StatKind::Font, period, &buckets).await?;
+    let shots = count_series(db, StatKind::Shot, period, &buckets).await?;
 
     Ok(buckets
         .into_iter()
@@ -3369,6 +3374,7 @@ async fn stat_buckets(
             secrets: *secrets.get(&bucket).unwrap_or(&0),
             favicons: *favicons.get(&bucket).unwrap_or(&0),
             fonts: *fonts.get(&bucket).unwrap_or(&0),
+            shots: *shots.get(&bucket).unwrap_or(&0),
         })
         .collect())
 }
@@ -3571,6 +3577,7 @@ async fn record_stat_batch(db: &PgPool, batch: &[StatEvent]) -> AppResult<()> {
             StatKind::Secret,
             StatKind::Favicon,
             StatKind::Font,
+            StatKind::Shot,
         ] {
             let count = batch.iter().filter(|event| event.kind == kind).count();
             if count > 0 {
@@ -4512,6 +4519,7 @@ enum StatKind {
     Secret,
     Favicon,
     Font,
+    Shot,
 }
 
 impl StatKind {
@@ -4525,6 +4533,7 @@ impl StatKind {
             Self::Secret => "s",
             Self::Favicon => "c",
             Self::Font => "o",
+            Self::Shot => "t",
         }
     }
 }
@@ -5461,6 +5470,8 @@ async fn shot(State(state): State<AppState>, RawQuery(raw_query): RawQuery) -> A
 
     let key = spec.cache_key();
     if let Some(bytes) = shot_cache_lookup(&state, &key).await? {
+        info!(url = %spec.url, bytes = bytes.len(), "screenshot served from cache");
+        record_stat_soon(&state, StatKind::Shot, None);
         return Ok(shot_png_response(bytes, true));
     }
 
@@ -5472,25 +5483,44 @@ async fn shot(State(state): State<AppState>, RawQuery(raw_query): RawQuery) -> A
         .map_err(internal)?;
     // A queued identical request may have been rendered while we waited.
     if let Some(bytes) = shot_cache_lookup(&state, &key).await? {
+        info!(url = %spec.url, bytes = bytes.len(), "screenshot served from cache");
+        record_stat_soon(&state, StatKind::Shot, None);
         return Ok(shot_png_response(bytes, true));
     }
 
     let client = chrome_client(&state).await?;
     let nav_timeout = Duration::from_secs_f64(state.config.shot_nav_timeout_seconds);
+    let started = Instant::now();
     let png = match tokio::time::timeout(
         nav_timeout + Duration::from_secs(20),
         shot_render(&client, &spec, nav_timeout),
     )
     .await
     {
-        Ok(result) => result?,
+        Ok(Ok(png)) => png,
+        Ok(Err(err)) => {
+            info!(url = %spec.url, error = %err.message, "screenshot failed");
+            return Err(err);
+        }
         Err(_) => {
+            info!(url = %spec.url, "screenshot render timed out");
             return Err(AppError::new(
                 StatusCode::GATEWAY_TIMEOUT,
                 "render timed out",
             ));
         }
     };
+    info!(
+        url = %spec.url,
+        width = spec.width,
+        height = spec.height,
+        scale = spec.scale,
+        scheme = spec.scheme.as_str(),
+        ms = started.elapsed().as_millis() as u64,
+        bytes = png.len(),
+        "screenshot rendered"
+    );
+    record_stat_soon(&state, StatKind::Shot, None);
     shot_cache_store(&state, &key, &png).await?;
     Ok(shot_png_response(png, false))
 }
