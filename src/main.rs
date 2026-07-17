@@ -182,6 +182,7 @@ struct Config {
     shot_ts_window_seconds: i64,
     shot_nav_timeout_seconds: f64,
     shot_cache_seconds: f64,
+    shot_chrome_max_renders: u64,
 }
 
 #[derive(Debug)]
@@ -4687,6 +4688,7 @@ impl Config {
             shot_ts_window_seconds: env_u64("SHOT_TS_WINDOW_SECONDS", 300).max(1) as i64,
             shot_nav_timeout_seconds: env_f64("SHOT_NAV_TIMEOUT_SECONDS", 10.0).max(1.0),
             shot_cache_seconds: env_f64("SHOT_CACHE_SECONDS", 3600.0).max(1.0),
+            shot_chrome_max_renders: env_u64("SHOT_CHROME_MAX_RENDERS", 64).max(1),
         })
     }
 }
@@ -4950,6 +4952,7 @@ async fn shot_check_url(url_text: &str) -> AppResult<()> {
 #[derive(Clone)]
 struct CdpClient {
     tx: mpsc::Sender<CdpRequest>,
+    renders: Arc<AtomicU64>,
 }
 
 enum CdpRequest {
@@ -5094,12 +5097,18 @@ async fn spawn_chrome(config: &Config) -> Result<CdpClient, String> {
             "--disable-sync",
             "--disable-dev-shm-usage",
             "--force-color-profile=srgb",
+            // Bound memory: at most one renderer per concurrent render, each
+            // with a capped V8 heap. The browser is also recycled after
+            // SHOT_CHROME_MAX_RENDERS renders (see chrome_client) and should
+            // sit under a cgroup ceiling in deployment (systemd MemoryMax).
+            "--js-flags=--max-old-space-size=256",
             // Crashpad insists on a writable database under $HOME; under a
             // hardened unit (ReadOnlyDirectories=/) that kills Chrome before
             // it publishes DevToolsActivePort.
             "--disable-crash-reporter",
             "--disable-breakpad",
         ])
+        .arg(format!("--renderer-process-limit={SHOT_MAX_CONCURRENT}"))
         .args(&config.shot_chrome_args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -5135,15 +5144,22 @@ async fn spawn_chrome(config: &Config) -> Result<CdpClient, String> {
     let (tx, rx) = mpsc::channel(64);
     tokio::spawn(cdp_actor(ws, rx, child, user_data_dir));
     info!("chrome ready for screenshots");
-    Ok(CdpClient { tx })
+    Ok(CdpClient {
+        tx,
+        renders: Arc::new(AtomicU64::new(0)),
+    })
 }
 
 async fn chrome_client(state: &AppState) -> AppResult<CdpClient> {
     let mut guard = state.chrome.lock().await;
     if let Some(client) = guard.as_ref() {
-        if !client.tx.is_closed() {
+        let recycled = client.renders.load(Ordering::Relaxed) >= state.config.shot_chrome_max_renders;
+        if !client.tx.is_closed() && !recycled {
             return Ok(client.clone());
         }
+        // Replacing the handle drops this clone of the actor's channel;
+        // in-flight renders keep their own clones, so the old browser exits
+        // (and is killed) once they finish.
     }
     let client = spawn_chrome(&state.config).await.map_err(|err| {
         error!(%err, "chrome spawn failed");
@@ -5191,6 +5207,7 @@ async fn shot_render(client: &CdpClient, spec: &ShotSpec, nav_timeout: Duration)
     let Some(context_id) = context.get("browserContextId").and_then(Value::as_str) else {
         return Err(shot_backend_error("no browserContextId".to_owned()));
     };
+    client.renders.fetch_add(1, Ordering::Relaxed);
     let _guard = ShotContextGuard {
         client: client.clone(),
         context_id: context_id.to_owned(),
@@ -5995,6 +6012,7 @@ mod tests {
             shot_ts_window_seconds: 300,
             shot_nav_timeout_seconds: 10.0,
             shot_cache_seconds: 3600.0,
+            shot_chrome_max_renders: 64,
         }
     }
 
@@ -6040,6 +6058,7 @@ mod tests {
             shot_ts_window_seconds: 300,
             shot_nav_timeout_seconds: 10.0,
             shot_cache_seconds: 3600.0,
+            shot_chrome_max_renders: 64,
         };
 
         let router = Router::new()
@@ -7165,6 +7184,7 @@ axes {
             shot_ts_window_seconds: 300,
             shot_nav_timeout_seconds: 10.0,
             shot_cache_seconds: 3600.0,
+            shot_chrome_max_renders: 64,
         };
         Router::new()
             .route("/fonts", get(fonts_search))

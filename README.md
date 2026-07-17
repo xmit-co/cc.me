@@ -57,6 +57,14 @@ nix run github:xmit-co/cc.me
 | `SHOT_TS_WINDOW_SECONDS`  |                                `300` | Accepted `ts` skew in `/shot` documents                 |
 | `SHOT_NAV_TIMEOUT_SECONDS`|                                 `10` | Page-load timeout per screenshot                        |
 | `SHOT_CACHE_SECONDS`      |                               `3600` | Screenshot cache lifetime                               |
+| `SHOT_CHROME_MAX_RENDERS` |                                 `64` | Renders before the managed Chrome is recycled           |
+
+Chrome's memory is bounded in layers: renderers are limited to one per
+concurrent render with a capped V8 heap, the browser is respawned every
+`SHOT_CHROME_MAX_RENDERS` renders, and deployments should add a hard ceiling
+around the service (e.g. systemd `MemoryMax=2G`, `MemorySwapMax=0`) — under
+cgroup OOM the kernel kills the fattest process, a Chrome renderer, and the
+service respawns the browser on the next request.
 
 `GET /pow` documents a JWT-shaped proof-of-work token format with an in-browser
 solver and verifier; reference CPU (Node) and GPU (Metal, OpenCL) solvers live
